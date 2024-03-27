@@ -6,6 +6,8 @@ AC_CONFIG_HEADERS(config_ac.h:config_ac-h.in)
 AM_INIT_AUTOMAKE([1.7.2 foreign])
 AC_CONFIG_MACRO_DIR([m4])
 AC_PROG_CC
+AC_SYS_LARGEFILE
+AC_FUNC_FSEEKO
 AC_C_CONST
 AC_PROG_LIBTOOL
 
@@ -14,7 +16,7 @@ if test "x$PKG_CONFIG" = "x"; then
   AC_MSG_ERROR([please install pkg-config])
 fi
 
-AC_CONFIG_SUBDIRS([libpainter librfxcodec])
+AC_CONFIG_SUBDIRS([libjpeg libpainter librfxcodec])
 
 # Use silent rules by default if supported by Automake
 m4_ifdef([AM_SILENT_RULES], [AM_SILENT_RULES([yes])])
@@ -103,24 +105,25 @@ AC_ARG_ENABLE(pam-config, AS_HELP_STRING([--enable-pam-config=CONF],
 AC_ARG_ENABLE(devel_all, AS_HELP_STRING([--enable-devel-all],
               [Enable all development options (default: no)]),
               [devel_all=$enableval], [devel_all=no])
+AC_ARG_ENABLE(devel_all_optimized, AS_HELP_STRING([--enable-devel-all-optimized],
+              [Enable all development options with O2 (default: no)]),
+              [devel_all_optimized=$enableval], [devel_all_optimized=no])
 AC_ARG_ENABLE(devel_debug, AS_HELP_STRING([--enable-devel-debug],
               [Build exes with no optimisation and debugging symbols (default: no)]),
               [devel_debug=$enableval], [devel_debug=$devel_all])
 AM_CONDITIONAL(DEVEL_DEBUG, [test x$devel_debug = xyes ])
+AM_CONDITIONAL(DEVEL_DEBUG_OPTIMIZED, [test x$devel_all_optimized = xyes ])
 AC_ARG_ENABLE(devel_logging, AS_HELP_STRING([--enable-devel-logging],
               [Enable development logging (default: no)]),
-              [devel_logging=$enableval], [devel_logging=$devel_all])
+              [devel_logging=$enableval], [devel_logging=$devel_all], [devel_logging=$devel_all_optimized])
 AC_ARG_ENABLE(devel_streamcheck, AS_HELP_STRING([--enable-devel-streamcheck],
               [Add range-check/abort to stream primitives (default: no)]),
-              [devel_streamcheck=$enableval], [devel_streamcheck=$devel_all])
+              [devel_streamcheck=$enableval], [devel_streamcheck=$devel_all], [devel_streamcheck=$devel_all_optimized])
 
 AC_ARG_ENABLE(neutrinordp, AS_HELP_STRING([--enable-neutrinordp],
               [Build neutrinordp module (default: no)]),
               [], [enable_neutrinordp=no])
 AM_CONDITIONAL(XRDP_NEUTRINORDP, [test x$enable_neutrinordp = xyes])
-AC_ARG_ENABLE(jpeg, AS_HELP_STRING([--enable-jpeg],
-              [Build jpeg module (default: no)]),
-              [], [enable_jpeg=no])
 AM_CONDITIONAL(XRDP_JPEG, [test x$enable_jpeg = xyes])
 AC_ARG_ENABLE(tjpeg, AS_HELP_STRING([--enable-tjpeg],
               [Build turbo jpeg module (default: no)]),
@@ -151,6 +154,11 @@ AC_ARG_ENABLE(pixman, AS_HELP_STRING([--enable-pixman],
               [], [enable_pixman=no])
 AM_CONDITIONAL(XRDP_PIXMAN, [test x$enable_pixman = xyes])
 
+AC_ARG_ENABLE(udev, AS_HELP_STRING([--enable-udev],
+              [Use udev library (default: yes)]),
+              [], [enable_udev=yes])
+AM_CONDITIONAL(XRDP_UDEV, [test x$enable_udev = xyes])
+
 AC_ARG_ENABLE(painter, AS_HELP_STRING([--disable-painter],
               [Do not use included painter library (default: no)]),
               [], [enable_painter=yes])
@@ -160,6 +168,8 @@ AC_ARG_ENABLE(rfxcodec, AS_HELP_STRING([--disable-rfxcodec],
               [Do not use included librfxcodec library (default: no)]),
               [], [enable_rfxcodec=yes])
 AM_CONDITIONAL(XRDP_RFXCODEC, [test x$enable_rfxcodec = xyes])
+
+
 
 AC_ARG_ENABLE(rdpsndaudin, AS_HELP_STRING([--enable-rdpsndaudin],
               [Use rdpsnd audio in (default: no)]),
@@ -188,6 +198,9 @@ AM_COND_IF([LINUX],
 AM_COND_IF([DEVEL_DEBUG],
   [AX_APPEND_COMPILE_FLAGS([-g -O0])],
   [AX_APPEND_COMPILE_FLAGS([-O2])])
+
+AM_COND_IF([DEVEL_DEBUG_OPTIMIZED],
+  [AX_APPEND_COMPILE_FLAGS([-g -O2])])
 
 # Don't fail without working nasm if rfxcodec is not enabled
 if test "x$enable_rfxcodec" != xyes; then
@@ -346,13 +359,6 @@ fi
 
 AS_IF( [test "x$enable_neutrinordp" = "xyes"] , [PKG_CHECK_MODULES(FREERDP, freerdp >= 1.0.0)] )
 
-# checking for libjpeg
-if test "x$enable_jpeg" = "xyes"
-then
-  AC_CHECK_HEADER([jpeglib.h], [],
-    [AC_MSG_ERROR([please install libjpeg-dev or libjpeg-devel])])
-fi
-
 # checking for fuse
 if test "x$enable_fuse" = "xyes"
 then
@@ -382,6 +388,7 @@ then
 fi
 
 AS_IF( [test "x$enable_pixman" = "xyes"] , [PKG_CHECK_MODULES(PIXMAN, pixman-1 >= 0.1.0)] )
+AS_IF( [test "x$enable_udev" = "xyes"] , [PKG_CHECK_MODULES(UDEV, libudev >= 2.0)] )
 
 # checking for TurboJPEG
 if test "x$enable_tjpeg" = "xyes"
@@ -459,7 +466,7 @@ AC_ARG_ENABLE([strict-locations],
                    (default: use /etc and /var)])],
                   [], [enable_strict_locations=no])
 
-if test "x$enable_strict_locations" != "xyes"; then
+if test "x$enable_strict_locations" == "xyes"; then
   sysconfdir="/etc";
   localstatedir="/var";
 fi
@@ -472,12 +479,12 @@ AC_CONFIG_FILES([
   common/Makefile
   docs/Makefile
   docs/man/Makefile
-  genkeymap/Makefile
   instfiles/default/Makefile
   instfiles/init.d/Makefile
   instfiles/Makefile
   instfiles/pam.d/Makefile
   instfiles/pulse/Makefile
+  instfiles/prepost/Makefile
   instfiles/rc.d/Makefile
   keygen/Makefile
   libxrdp/Makefile
@@ -490,15 +497,11 @@ AC_CONFIG_FILES([
   sesman/chansrv/Makefile
   sesman/libscp/Makefile
   sesman/Makefile
-  sesman/tools/Makefile
   tests/Makefile
   tests/common/Makefile
   tests/libxrdp/Makefile
   tests/memtest/Makefile
   tests/xrdp/Makefile
-  tools/Makefile
-  tools/devel/Makefile
-  tools/devel/tcp_proxy/Makefile
   vnc/Makefile
   xrdpapi/Makefile
   xrdp/Makefile
@@ -507,6 +510,8 @@ AC_CONFIG_FILES([
 ])
 
 AC_REQUIRE_AUX_FILE([tap-driver.sh])
+
+CPPFLAGS="-include config_ac.h $CPPFLAGS"
 AC_OUTPUT
 
 echo ""
@@ -520,6 +525,7 @@ echo "  turbo jpeg              $enable_tjpeg"
 echo "  rfxcodec                $enable_rfxcodec"
 echo "  painter                 $enable_painter"
 echo "  pixman                  $enable_pixman"
+echo "  udev                    $enable_udev"
 echo "  fuse                    $enable_fuse"
 echo "  ipv6                    $enable_ipv6"
 echo "  ipv6only                $enable_ipv6only"
@@ -552,4 +558,3 @@ echo "  LDFLAGS = $LDFLAGS"
 echo '#define XRDP_CONFIGURE_OPTIONS \' > ./xrdp_configure_options.h
 ./config.status --config | xargs -n 1 | sed -e 's/^/"      /' -e 's/$/\\n" \\/' >> ./xrdp_configure_options.h
 echo '""' >> ./xrdp_configure_options.h
-

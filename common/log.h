@@ -29,7 +29,7 @@
  * development macros
  */
 #ifndef CONFIG_AC_H
-#   error config_ac.h not visible in log.h
+#   warning config_ac.h not visible in log.h
 #endif
 
 /* logging buffer size */

@@ -7,11 +7,13 @@ BindsTo=xrdp.service
 
 [Service]
 Type=forking
-PIDFile=@localstatedir@/run/xrdp-sesman.pid
+PIDFile=@localstatedir@/run/xrdp/xrdp-sesman.pid
 EnvironmentFile=-@sysconfdir@/sysconfig/xrdp
 EnvironmentFile=-@sysconfdir@/default/xrdp
+ExecStartPre=/bin/sh @sysconfdir@/xrdp/prepost/startpre.sh
 ExecStart=@sbindir@/xrdp-sesman $SESMAN_OPTIONS
 ExecStop=@sbindir@/xrdp-sesman $SESMAN_OPTIONS --kill
+ExecStopPost=/bin/sh @sysconfdir@/xrdp/prepost/stoppost.sh
 
 [Install]
 WantedBy=multi-user.target

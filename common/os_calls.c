@@ -127,7 +127,7 @@ g_mk_socket_path(const char *app_name)
                 return 1;
             }
         }
-        g_chmod_hex(XRDP_SOCKET_PATH, 0x1777);
+        g_chmod_hex(XRDP_SOCKET_PATH, 0x3777);
     }
     return 0;
 }

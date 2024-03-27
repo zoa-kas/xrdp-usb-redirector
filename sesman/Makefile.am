@@ -6,7 +6,7 @@ AM_CPPFLAGS = \
   -DXRDP_CFG_PATH=\"${sysconfdir}/xrdp\" \
   -DXRDP_SBIN_PATH=\"${sbindir}\" \
   -DXRDP_SHARE_PATH=\"${datadir}/xrdp\" \
-  -DXRDP_PID_PATH=\"${localstatedir}/run\" \
+  -DXRDP_PID_PATH=\"${localstatedir}/run/xrdp\" \
   -DXRDP_SOCKET_PATH=\"${socketdir}\" \
   -I$(top_srcdir)/common \
   -I$(top_srcdir)/sesman/libscp
@@ -91,5 +91,4 @@ dist_sesmansysconf_SCRIPTS = \
 
 SUBDIRS = \
   libscp \
-  tools \
   chansrv

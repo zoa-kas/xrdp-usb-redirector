@@ -27,6 +27,12 @@ else
 XRDPVRDIR =
 endif
 
+if XRDP_JPEG
+JPEGDIR = libjpeg
+else
+JPEGDIR =
+endif
+
 if XRDP_PAINTER
 PAINTERDIR = libpainter
 else
@@ -39,12 +45,14 @@ else
 RFXCODECDIR =
 endif
 
+
 SUBDIRS = \
   common \
   vnc \
   xup \
   mc \
   $(NEUTRINORDPDIR) \
+  $(JPEGDIR) \
   libxrdp \
   $(PAINTERDIR) \
   $(RFXCODECDIR) \
@@ -53,12 +61,10 @@ SUBDIRS = \
   keygen \
   docs \
   instfiles \
-  genkeymap \
   xrdpapi \
   pkgconfig \
   $(XRDPVRDIR) \
-  tests \
-  tools
+  tests
 
 distclean-local:
 	-rm -f xrdp_configure_options.h

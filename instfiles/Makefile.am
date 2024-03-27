@@ -60,7 +60,8 @@ SUBDIRS =
 if LINUX
 SUBDIRS += \
   pam.d \
-  pulse
+  pulse \
+  prepost
 if HAVE_SYSTEMD
 systemdsystemunit_DATA = \
   xrdp-sesman.service \

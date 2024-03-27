@@ -40,6 +40,7 @@
 #include "chansrv_config.h"
 #include "xrdp_sockets.h"
 #include "audin.h"
+#include "urbdrc.h"
 
 #include "ms-rdpbcgr.h"
 
@@ -340,6 +341,7 @@ process_message_channel_setup(struct stream *s)
     int index;
     int rv;
     struct chan_item *ci;
+    static struct urbdrc_drdynvc_procs chansrv_drdynvc_procs;
 
     g_num_chan_items = 0;
     g_cliprdr_index = -1;
@@ -419,6 +421,11 @@ process_message_channel_setup(struct stream *s)
     }
 
     audin_init();
+
+    chansrv_drdynvc_procs.drdynvc_open = chansrv_drdynvc_open;
+    chansrv_drdynvc_procs.drdynvc_data = chansrv_drdynvc_data;
+    chansrv_drdynvc_procs.drdynvc_send_data = chansrv_drdynvc_send_data;
+    urbdrc_init(&chansrv_drdynvc_procs);
 
     return rv;
 }
@@ -570,7 +577,8 @@ process_message_drdynvc_close_response(struct stream *s)
         return 1;
     }
     drdynvc = g_drdynvcs + chan_id;
-    if (drdynvc->status != CHANSRV_DRDYNVC_STATUS_CLOSE_SENT)
+    if (drdynvc->status != CHANSRV_DRDYNVC_STATUS_OPEN &&
+        drdynvc->status != CHANSRV_DRDYNVC_STATUS_CLOSE_SENT)
     {
         LOG_DEVEL(LOG_LEVEL_ERROR, "process_message_drdynvc_close_response: status not right");
         return 0;
@@ -1419,6 +1427,7 @@ channel_thread_loop(void *in_val)
                 sound_deinit();
                 devredir_deinit();
                 rail_deinit();
+				urbdrc_deinit();
                 break;
             }
 
@@ -1441,6 +1450,7 @@ channel_thread_loop(void *in_val)
                     sound_deinit();
                     devredir_deinit();
                     rail_deinit();
+                    urbdrc_deinit();
                     /* delete g_con_trans */
                     trans_delete(g_con_trans);
                     g_con_trans = 0;
@@ -1467,6 +1477,7 @@ channel_thread_loop(void *in_val)
             sound_check_wait_objs();
             devredir_check_wait_objs();
             xfuse_check_wait_objs();
+            urbdrc_check_wait_objs();
             timeout = -1;
             num_objs = 0;
             num_wobjs = 0;
@@ -1486,6 +1497,7 @@ channel_thread_loop(void *in_val)
             sound_get_wait_objs(objs, &num_objs, &timeout);
             devredir_get_wait_objs(objs, &num_objs, &timeout);
             xfuse_get_wait_objs(objs, &num_objs, &timeout);
+            urbdrc_get_wait_objs(objs, &num_objs, &timeout);
             get_timeout(&timeout);
         } /* end while (g_obj_wait(objs, num_objs, 0, 0, timeout) == 0) */
     }
@@ -1553,6 +1565,7 @@ x_server_fatal_handler(void)
 {
     LOG_DEVEL(LOG_LEVEL_INFO, "xserver_fatal_handler: entered.......");
     /* At this point the X server has gone away. Dont make any X calls. */
+    urbdrc_deinit();
     xfuse_deinit();
     exit(0);
 }
@@ -1813,4 +1826,3 @@ main(int argc, char **argv)
     LOG_DEVEL(LOG_LEVEL_INFO, "main: app exiting pid %d(0x%8.8x)", pid, pid);
     return 0;
 }
-

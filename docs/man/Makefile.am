@@ -4,8 +4,6 @@ man_MANS = \
   xrdp.ini.5 \
   xrdp.8 \
   xrdp-chansrv.8 \
-  xrdp-genkeymap.8 \
-  xrdp-keygen.8 \
   xrdp-sesadmin.8 \
   xrdp-sesman.8 \
   xrdp-sesrun.8

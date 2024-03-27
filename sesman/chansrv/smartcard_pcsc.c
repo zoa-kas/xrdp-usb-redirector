@@ -41,9 +41,13 @@
 #include "trans.h"
 #include "chansrv.h"
 #include "list.h"
+#include "defines.h"
 
 #if PCSC_STANDIN
 
+
+#define MAX_ATR_SIZE 33
+#define MAX_READERS 16
 
 extern int g_display_num; /* in chansrv.c */
 
@@ -55,6 +59,17 @@ struct pcsc_card /* item for list of open cards in one context */
     int card_bytes;  /* client card bytes */
     char card[16];   /* client card */
 };
+
+typedef struct pubReaderStatesList
+{
+    char readerName[128];
+    tui32 eventCounter;
+    tui32 readerState;
+    tui32 readerSharing;
+    tui8 cardAtr[MAX_ATR_SIZE];
+    tui32 cardAtrLength;
+    tui32 cardProtocol;
+} PCSC_READER_STATE;
 
 struct pcsc_context
 {
@@ -70,7 +85,21 @@ struct pcsc_uds_client
     int uds_client_id;     /* unique id represents each app */
     struct trans *con;     /* the connection to the app */
     struct list *contexts; /* list of struct pcsc_context */
-    struct pcsc_context *connect_context;
+
+    struct pcsc_context *connect_context; /* TODO remove this */
+
+    int state;
+    int pad1;
+
+    PCSC_READER_STATE readerStates[MAX_READERS];
+    tui32 current_states[MAX_READERS];
+    tui32 event_states[MAX_READERS];
+    int numReaders;
+    int waiting;
+    int something_changed;
+    int send_status;
+    int vMajor;
+    int vMinor;
 };
 
 static struct list *g_uds_clients = 0; /* struct pcsc_uds_client */
@@ -113,12 +142,12 @@ get_uds_client_by_id(int uds_client_id)
     LOG_DEVEL(LOG_LEVEL_DEBUG, "get_uds_client_by_id:");
     if (uds_client_id == 0)
     {
-        LOG(LOG_LEVEL_ERROR, "get_uds_client_by_id: uds_client_id is zero");
+        LOG(LOG_LEVEL_DEBUG, "get_uds_client_by_id: uds_client_id is zero");
         return 0;
     }
     if (g_uds_clients == 0)
     {
-        LOG(LOG_LEVEL_ERROR, "get_uds_client_by_id: g_uds_clients is nil");
+        LOG(LOG_LEVEL_DEBUG, "get_uds_client_by_id: g_uds_clients is nil");
         return 0;
     }
     LOG_DEVEL(LOG_LEVEL_DEBUG, "  count %d", g_uds_clients->count);
@@ -131,9 +160,24 @@ get_uds_client_by_id(int uds_client_id)
             return uds_client;
         }
     }
-    LOG(LOG_LEVEL_ERROR, "get_uds_client_by_id: can't find uds_client_id %d",
+    LOG(LOG_LEVEL_DEBUG, "get_uds_client_by_id: can't find uds_client_id %d",
         uds_client_id);
     return 0;
+}
+
+/*****************************************************************************/
+struct pcsc_context *
+get_first_pcsc_context(struct pcsc_uds_client *uds_client)
+{
+    if (uds_client == 0)
+    {
+        return 0;
+    }
+    if (uds_client->contexts == 0)
+    {
+        return 0;
+    }
+    return (struct pcsc_context *) list_get_item(uds_client->contexts, 0);
 }
 
 /*****************************************************************************/
@@ -232,6 +276,7 @@ free_uds_client(struct pcsc_uds_client *uds_client)
     {
         return 0;
     }
+    LOG_DEVEL(LOG_LEVEL_DEBUG, "free_uds_client: freeing");
     if (uds_client->contexts != 0)
     {
         for (i = 0; i < uds_client->contexts->count; i++)
@@ -255,7 +300,6 @@ free_uds_client(struct pcsc_uds_client *uds_client)
                     list_delete(context->cards);
                 }
                 LOG_DEVEL(LOG_LEVEL_DEBUG, "  left over context %p", context->context);
-                scard_send_cancel(0, context->context, context->context_bytes);
                 scard_send_release_context(0, context->context,
                                            context->context_bytes);
                 g_free(context);
@@ -264,7 +308,38 @@ free_uds_client(struct pcsc_uds_client *uds_client)
         list_delete(uds_client->contexts);
     }
     trans_delete(uds_client->con);
+    list_remove_item(g_uds_clients,
+        list_index_of(g_uds_clients, (tintptr)uds_client));
     g_free(uds_client);
+    return 0;
+}
+
+/*****************************************************************************/
+static int
+cancel_uds_client(struct pcsc_uds_client *uds_client)
+{
+    int i;
+    struct pcsc_context *context;
+    void *user_data;
+
+    LOG_DEVEL(LOG_LEVEL_DEBUG, "cancel_uds_client:");
+    if (uds_client == 0)
+    {
+        return 0;
+    }
+    if (uds_client->contexts != 0)
+    {
+        for (i = 0; i < uds_client->contexts->count; i++)
+        {
+            context = (struct pcsc_context *)
+                      list_get_item(uds_client->contexts, i);
+            if (context != 0)
+            {
+                user_data = (void *) (tintptr) (uds_client->uds_client_id);
+                scard_send_cancel(user_data, context->context, context->context_bytes);
+            }
+        }
+    }
     return 0;
 }
 
@@ -276,8 +351,7 @@ uds_client_add_context(struct pcsc_uds_client *uds_client,
     struct pcsc_context *pcscContext;
 
     LOG_DEVEL(LOG_LEVEL_DEBUG, "uds_client_add_context:");
-    pcscContext = (struct pcsc_context *)
-                  g_malloc(sizeof(struct pcsc_context), 1);
+    pcscContext = g_new0(struct pcsc_context, 1);
     if (pcscContext == 0)
     {
         LOG(LOG_LEVEL_ERROR,
@@ -296,6 +370,7 @@ uds_client_add_context(struct pcsc_uds_client *uds_client,
             LOG(LOG_LEVEL_ERROR,
                 "uds_client_add_context: failed to allocate memory for "
                 "uds_client->contexts");
+            g_free(pcscContext);
             return 0;
         }
     }
@@ -337,8 +412,7 @@ context_add_card(struct pcsc_uds_client *uds_client,
     struct pcsc_card *pcscCard;
 
     LOG_DEVEL(LOG_LEVEL_DEBUG, "context_add_card: card_bytes %d", card_bytes);
-    pcscCard = (struct pcsc_card *)
-               g_malloc(sizeof(struct pcsc_card), 1);
+    pcscCard = g_new0(struct pcsc_card, 1);
     if (pcscCard == 0)
     {
         LOG(LOG_LEVEL_ERROR,
@@ -356,6 +430,7 @@ context_add_card(struct pcsc_uds_client *uds_client,
         {
             LOG(LOG_LEVEL_ERROR, "context_add_card: failed to allocate "
                 "memory for uds_client->contexts->cards");
+            g_free(pcscCard);
             return 0;
         }
     }
@@ -418,8 +493,9 @@ scard_pcsc_check_wait_objs(void)
             {
                 if (trans_check_wait_objs(uds_client->con) != 0)
                 {
+                    LOG(LOG_LEVEL_INFO, "scard_pcsc_check_wait_objs: calling free_uds_client");
+                    cancel_uds_client(uds_client);
                     free_uds_client(uds_client);
-                    list_remove_item(g_uds_clients, index);
                     continue;
                 }
             }
@@ -454,10 +530,11 @@ scard_function_establish_context_return(void *user_data,
                                         struct stream *in_s,
                                         int len, int status)
 {
-    int bytes;
+    int rv;
     int uds_client_id;
     int context_bytes;
     int app_context;
+    int return_code;
     char context[16];
     struct stream *out_s;
     struct pcsc_uds_client *uds_client;
@@ -466,30 +543,44 @@ scard_function_establish_context_return(void *user_data,
 
     LOG_DEVEL(LOG_LEVEL_DEBUG, "scard_function_establish_context_return:");
     LOG_DEVEL(LOG_LEVEL_DEBUG, "  status 0x%8.8x", status);
+    rv = 0;
     uds_client_id = (int) (tintptr) user_data;
     uds_client = (struct pcsc_uds_client *)
                  get_uds_client_by_id(uds_client_id);
     if (uds_client == 0)
     {
-        LOG(LOG_LEVEL_ERROR, "scard_function_establish_context_return: "
-            "get_uds_client_by_id failed to find uds_client_id %d",
+        LOG(LOG_LEVEL_DEBUG, "scard_function_establish_context_return: "
+            "uds_client %d not found",
             uds_client_id);
-        return 1;
+        return 0;
     }
     con = uds_client->con;
     lcontext = 0;
     app_context = 0;
+    return_code = 0;
     g_memset(context, 0, 16);
     if (status == 0)
     {
-        in_uint8s(in_s, 28);
+        in_uint8s(in_s, 16);
+        in_uint32_le(in_s, return_code);
+        in_uint8s(in_s, 8);
         in_uint32_le(in_s, context_bytes);
-        if (context_bytes > 16)
+        if (return_code != 0 || context_bytes < 4 || context_bytes > 16)
         {
-            LOG(LOG_LEVEL_ERROR, "scard_function_establish_context_return: opps "
-                "context_bytes %d", context_bytes);
-            LOG_DEVEL_HEXDUMP(LOG_LEVEL_TRACE, "", in_s->p, context_bytes);
-            return 1;
+            LOG(LOG_LEVEL_ERROR, "scard_function_establish_context_return: error "
+                   "return_code 0x%8.8x context_bytes %d",
+                   return_code, context_bytes);
+            if (uds_client->state == 1)
+            {
+                out_s = trans_get_out_s(uds_client->con, 8192);
+                out_uint32_le(out_s, 4);
+                out_uint32_le(out_s, 3);
+                out_uint32_le(out_s, 0x80100001); /* result */
+                s_mark_end(out_s);
+                rv = trans_write_copy(uds_client->con);
+                uds_client->state = 0;
+            }
+            return rv;
         }
         in_uint8a(in_s, context, context_bytes);
         lcontext = uds_client_add_context(uds_client, context, context_bytes);
@@ -497,16 +588,39 @@ scard_function_establish_context_return(void *user_data,
         LOG_DEVEL(LOG_LEVEL_DEBUG, "scard_function_establish_context_return: "
                   "app_context %d", app_context);
     }
-    out_s = trans_get_out_s(con, 8192);
-    s_push_layer(out_s, iso_hdr, 8);
-    out_uint32_le(out_s, app_context);
-    out_uint32_le(out_s, status); /* SCARD_S_SUCCESS status */
-    s_mark_end(out_s);
-    bytes = (int) (out_s->end - out_s->data);
-    s_pop_layer(out_s, iso_hdr);
-    out_uint32_le(out_s, bytes - 8);
-    out_uint32_le(out_s, 0x01); /* SCARD_ESTABLISH_CONTEXT 0x01 */
-    return trans_force_write(con);
+    else
+    {
+        LOG_DEVEL(LOG_LEVEL_DEBUG, "scard_function_establish_context_return: error "
+               "status %d", status);
+        if (uds_client->state == 1)
+        {
+            out_s = trans_get_out_s(uds_client->con, 8192);
+            out_uint32_le(out_s, 4);
+            out_uint32_le(out_s, 3);
+            out_uint32_le(out_s, 0x80100001); /* result */
+            s_mark_end(out_s);
+            rv = trans_write_copy(uds_client->con);
+            uds_client->state = 0;
+        }
+        return rv;
+    }
+    if (uds_client->state == 1)
+    {
+        scard_send_list_readers((void*)(tintptr)uds_client->uds_client_id,
+                                lcontext->context,
+                                lcontext->context_bytes,
+                                0, 8148, 0, 0);
+    }
+    else if (uds_client->state == 0)
+    {
+        out_s = trans_get_out_s(con, 8192);
+        out_uint32_le(out_s, 0); /* dwScope */
+        out_uint32_le(out_s, app_context); /* hContext  */
+        out_uint32_le(out_s, return_code); /* rv  */
+        s_mark_end(out_s);
+        rv = trans_write_copy(con);
+    }
+    return rv;
 }
 
 /*****************************************************************************/
@@ -544,8 +658,9 @@ scard_function_release_context_return(void *user_data,
                                       struct stream *in_s,
                                       int len, int status)
 {
-    int bytes;
+    int rv;
     int uds_client_id;
+    int return_code;
     struct stream *out_s;
     struct pcsc_uds_client *uds_client;
     struct trans *con;
@@ -557,80 +672,98 @@ scard_function_release_context_return(void *user_data,
                  get_uds_client_by_id(uds_client_id);
     if (uds_client == 0)
     {
-        LOG(LOG_LEVEL_ERROR, "scard_function_release_context_return: "
-            "get_uds_client_by_id failed to find uds_client_id %d",
+        LOG(LOG_LEVEL_DEBUG, "scard_function_release_context_return: "
+            "uds_client %d not found",
             uds_client_id);
-        return 1;
+        return 0;
     }
     con = uds_client->con;
+    return_code = 0;
+    if (status == 0)
+    {
+        in_uint8s(in_s, 16);
+        in_uint32_le(in_s, return_code);
+    }
     out_s = trans_get_out_s(con, 8192);
-    s_push_layer(out_s, iso_hdr, 8);
-    out_uint32_le(out_s, status); /* SCARD_S_SUCCESS status */
+    out_uint32_le(out_s, 0); /* hContext */
+    out_uint32_le(out_s, return_code); /* rv */
     s_mark_end(out_s);
-    bytes = (int) (out_s->end - out_s->data);
-    s_pop_layer(out_s, iso_hdr);
-    out_uint32_le(out_s, bytes - 8);
-    out_uint32_le(out_s, 0x02); /* SCARD_RELEASE_CONTEXT 0x02 */
-    return trans_force_write(con);
+    rv = trans_write_copy(con);
+    return rv;
 }
-
-/*****************************************************************************/
-struct pcsc_list_readers
-{
-    int uds_client_id;
-    int cchReaders;
-};
 
 /*****************************************************************************/
 /* returns error */
 int
 scard_process_list_readers(struct trans *con, struct stream *in_s)
 {
-    int hContext;
-    unsigned int bytes_groups;
-    int cchReaders;
-    /*
-     * At the time of writing, the groups strings which can be sent
-     * over this interface are all small:-
-     *
-     * "SCard$AllReaders", "SCard$DefaultReaders", "SCard$LocalReaders" and
-     * "SCard$SystemReaders"
-     *
-     * We'll allow a bit extra in case the interface changes
-     */
-    char groups[256];
-    struct pcsc_uds_client *uds_client;
-    struct pcsc_context *lcontext;
-    struct pcsc_list_readers *pcscListReaders;
+    return 0;
+}
 
-    LOG_DEVEL(LOG_LEVEL_DEBUG, "scard_process_list_readers:");
-    uds_client = (struct pcsc_uds_client *) (con->callback_data);
-    in_uint32_le(in_s, hContext);
-    in_uint32_le(in_s, bytes_groups);
-    if (bytes_groups > (sizeof(groups) - 1))
+/*****************************************************************************/
+static int
+scard_readers_to_list(struct pcsc_uds_client *uds_client,
+                      const char *names, int names_bytes)
+{
+    int reader_index;
+    int name_index;
+    int names_index;
+    char ch;
+    PCSC_READER_STATE hold_reader;
+
+    reader_index = 0;
+    name_index = 0;
+    names_index = 0;
+    hold_reader = uds_client->readerStates[reader_index];
+    while (names_index < names_bytes)
     {
-        LOG(LOG_LEVEL_ERROR, "scard_process_list_readers: Unreasonable string length %u",
-            bytes_groups);
-        return 1;
+        ch = names[names_index];
+        if (ch == 0)
+        {
+            if (name_index < 1)
+            {
+                break;
+            }
+            uds_client->readerStates[reader_index].readerName[name_index] = 0;
+            LOG_DEVEL(LOG_LEVEL_DEBUG, "scard_readers_to_list: name [%s]", uds_client->readerStates[reader_index].readerName);
+            /* clear if name changes */
+            if (g_strcmp(hold_reader.readerName, uds_client->readerStates[reader_index].readerName) != 0)
+            {
+                uds_client->something_changed = 1;
+                LOG_DEVEL(LOG_LEVEL_DEBUG, "scard_readers_to_list: name changed, clearing");
+                uds_client->readerStates[reader_index].eventCounter = 0;
+                uds_client->readerStates[reader_index].readerState = 0;
+                uds_client->readerStates[reader_index].readerSharing = 0;
+                g_memset(uds_client->readerStates[reader_index].cardAtr, 0, MAX_ATR_SIZE);
+                uds_client->readerStates[reader_index].cardAtrLength = 0;
+                uds_client->readerStates[reader_index].cardProtocol = 0;
+                uds_client->current_states[reader_index] = 0;
+                uds_client->event_states[reader_index] = 0;
+            }
+            reader_index++;
+            hold_reader = uds_client->readerStates[reader_index];
+            if (reader_index > (MAX_READERS - 1))
+            {
+                return 0;
+            }
+            name_index = 0;
+        }
+        else
+        {
+            uds_client->readerStates[reader_index].readerName[name_index] = ch;
+            name_index++;
+        }
+        names_index++;
     }
-    in_uint8a(in_s, groups, bytes_groups);
-    groups[bytes_groups] = '\0';
-    in_uint32_le(in_s, cchReaders);
-    LOG_DEVEL(LOG_LEVEL_DEBUG, "scard_process_list_readers: hContext 0x%8.8x cchReaders %d",
-              hContext, cchReaders);
-    lcontext = get_pcsc_context_by_app_context(uds_client, hContext);
-    if (lcontext == 0)
+    uds_client->numReaders = reader_index;
+    /* clear the rest */
+    while (reader_index < MAX_READERS)
     {
-        LOG(LOG_LEVEL_ERROR, "scard_process_list_readers: "
-            "get_pcsc_context_by_app_context failed");
-        g_free(groups);
-        return 1;
+        g_memset(uds_client->readerStates + reader_index, 0, sizeof(PCSC_READER_STATE));
+        uds_client->current_states[reader_index] = 0;
+        uds_client->event_states[reader_index] = 0;
+        reader_index++;
     }
-    pcscListReaders = g_new0(struct pcsc_list_readers, 1);
-    pcscListReaders->uds_client_id = uds_client->uds_client_id;
-    pcscListReaders->cchReaders = cchReaders;
-    scard_send_list_readers(pcscListReaders, lcontext->context,
-                            lcontext->context_bytes, groups, cchReaders, 1);
     return 0;
 }
 
@@ -640,103 +773,101 @@ scard_function_list_readers_return(void *user_data,
                                    struct stream *in_s,
                                    int len, int status)
 {
-    struct stream *out_s;
-    int            chr;
-    int            readers;
-    int            rn_index;
-    int            index;
-    int            bytes;
-    int            cchReaders;
-    int            llen;
+    int return_code;
+    int llen;
+    int rv;
+    int cardAtrLength;
     int uds_client_id;
-    twchar         reader_name[100];
-    char           lreader_name[16][100];
     struct pcsc_uds_client *uds_client;
-    struct trans *con;
-    struct pcsc_list_readers *pcscListReaders;
+    struct pcsc_context *context;
+
+    int index;
+    READER_STATE *rsa;
 
     LOG_DEVEL(LOG_LEVEL_DEBUG, "scard_function_list_readers_return:");
-    LOG_DEVEL(LOG_LEVEL_DEBUG, "  status 0x%8.8x", status);
-    pcscListReaders = (struct pcsc_list_readers *) user_data;
-    if (pcscListReaders == 0)
-    {
-        LOG(LOG_LEVEL_ERROR, "scard_function_list_readers_return: "
-            "pcscListReaders is nil");
-        return 1;
-    }
-    uds_client_id = pcscListReaders->uds_client_id;
-    cchReaders = pcscListReaders->cchReaders;
-    g_free(pcscListReaders);
+    uds_client_id = (int) (tintptr) user_data;
     uds_client = (struct pcsc_uds_client *)
                  get_uds_client_by_id(uds_client_id);
     if (uds_client == 0)
     {
-        LOG(LOG_LEVEL_ERROR, "scard_function_list_readers_return: "
-            "get_uds_client_by_id failed, could not find id %d",
+        LOG(LOG_LEVEL_DEBUG, "scard_function_list_readers_return: "
+            "uds_client %d not found",
             uds_client_id);
-        return 1;
+        return 0;
     }
-    con = uds_client->con;
-    g_memset(reader_name, 0, sizeof(reader_name));
-    g_memset(lreader_name, 0, sizeof(lreader_name));
-    rn_index = 0;
-    readers = 0;
-    llen = 0;
+
+    rv = 0;
     if (status == 0)
     {
-        in_uint8s(in_s, 28);
-        in_uint32_le(in_s, len);
-        llen = len;
-        if (cchReaders > 0)
+        context = get_first_pcsc_context(uds_client);
+        if (context != 0)
         {
-            while (len > 0)
+            rsa = g_new0(READER_STATE, 32);
+            if (rsa == 0)
             {
-                in_uint16_le(in_s, chr);
-                len -= 2;
-                if (chr == 0)
+                LOG(LOG_LEVEL_ERROR, "scard_function_list_readers_return: error, no memory");
+                return 1;
+            }
+            
+            in_uint8s(in_s, 16);
+            in_uint32_le(in_s, return_code);
+            if (return_code != 0)
+            {
+                LOG_DEVEL(LOG_LEVEL_DEBUG, "scard_function_list_readers_return: return_code 0x%8.8x", return_code);
+                uds_client->numReaders = 0;
+                g_memset(uds_client->readerStates, 0, sizeof(uds_client->readerStates));
+                g_memset(uds_client->current_states, 0, sizeof(uds_client->current_states));
+                g_memset(uds_client->event_states, 0, sizeof(uds_client->event_states));
+            }
+            else
+            {
+                in_uint8s(in_s, 4);
+                in_uint32_le(in_s, llen); /* pointer use as boolean */
+                if (llen != 0)
                 {
-                    if (reader_name[0] != 0)
+                    in_uint32_le(in_s, llen);
+                    LOG_DEVEL(LOG_LEVEL_DEBUG, "scard_function_list_readers_return: llen %d", llen);
+                    //g_hexdump(in_s->p, llen);
+                    scard_readers_to_list(uds_client, in_s->p, llen);
+                    for (index = 0; index < uds_client->numReaders; index++)
                     {
-                        g_wcstombs(lreader_name[readers], reader_name, 99);
-                        g_memset(reader_name, 0, sizeof(reader_name));
-                        readers++;
+                        g_strncpy(rsa[index].reader_name, uds_client->readerStates[index].readerName, 127);
+                        LOG_DEVEL(LOG_LEVEL_DEBUG, "scard_function_list_readers_return: reader for scard_send_get_status_change [%s]",
+                            uds_client->readerStates[index].readerName);
+                        rsa[index].current_state = uds_client->event_states[index] & ~2;
+                        rsa[index].event_state = uds_client->event_states[index];
+                        cardAtrLength = MIN(33, uds_client->readerStates[index].cardAtrLength);
+                        cardAtrLength = MAX(0, cardAtrLength);
+                        g_memcpy(rsa[index].atr, uds_client->readerStates[index].cardAtr, cardAtrLength);
+                        rsa[index].atr_len = cardAtrLength;
                     }
-                    reader_name[0] = 0;
-                    rn_index = 0;
                 }
                 else
                 {
-                    reader_name[rn_index] = chr;
-                    rn_index++;
+                    LOG_DEVEL(LOG_LEVEL_DEBUG, "scard_function_list_readers_return: llen zero");
+                    uds_client->numReaders = 0;
+                    g_memset(uds_client->readerStates, 0, sizeof(uds_client->readerStates));
+                    g_memset(uds_client->current_states, 0, sizeof(uds_client->current_states));
+                    g_memset(uds_client->event_states, 0, sizeof(uds_client->event_states));
                 }
             }
+            /* add plug and play notifier */
+            g_strncpy(rsa[uds_client->numReaders].reader_name, "\\\\?PnP?\\Notification", 127);
+            rsa[uds_client->numReaders].current_state = uds_client->numReaders << 16;
+            rsa[uds_client->numReaders].event_state = 0;
+            scard_send_get_status_change((void*)(tintptr)uds_client->uds_client_id,
+                                         context->context,
+                                         context->context_bytes,
+                                         0, 10, uds_client->numReaders + 1, rsa);
+            g_free(rsa);
         }
-        if (rn_index > 0)
+        else
         {
-            if (reader_name[0] != 0)
-            {
-                g_wcstombs(lreader_name[readers], reader_name, 99);
-                g_memset(reader_name, 0, sizeof(reader_name));
-                readers++;
-            }
+            LOG(LOG_LEVEL_ERROR, "scard_function_list_readers_return: error, no context");
+            rv = 1;
         }
     }
-
-    out_s = trans_get_out_s(con, 8192);
-    s_push_layer(out_s, iso_hdr, 8);
-    out_uint32_le(out_s, llen);
-    out_uint32_le(out_s, readers);
-    for (index = 0; index < readers; index++)
-    {
-        out_uint8a(out_s, lreader_name[index], 100);
-    }
-    out_uint32_le(out_s, status); /* SCARD_S_SUCCESS status */
-    s_mark_end(out_s);
-    bytes = (int) (out_s->end - out_s->data);
-    s_pop_layer(out_s, iso_hdr);
-    out_uint32_le(out_s, bytes - 8);
-    out_uint32_le(out_s, 0x03); /* SCARD_LIST_READERS 0x03 */
-    return trans_force_write(con);
+    return rv;
 }
 
 /*****************************************************************************/
@@ -750,11 +881,11 @@ scard_process_connect(struct trans *con, struct stream *in_s)
     void *user_data;
     struct pcsc_context *lcontext;
 
-    LOG_DEVEL(LOG_LEVEL_DEBUG, "scard_process_connect:");
-    uds_client = (struct pcsc_uds_client *) (con->callback_data);
+    LOG_DEVEL(LOG_LEVEL_DEBUG, "scard_process_establish_context:");
     g_memset(&rs, 0, sizeof(rs));
+    uds_client = (struct pcsc_uds_client *) (con->callback_data);
     in_uint32_le(in_s, hContext);
-    in_uint8a(in_s, rs.reader_name, 100);
+    in_uint8a(in_s, rs.reader_name, 128);
     in_uint32_le(in_s, rs.dwShareMode);
     in_uint32_le(in_s, rs.dwPreferredProtocols);
     LOG_DEVEL(LOG_LEVEL_DEBUG, "scard_process_connect: rs.reader_name %s dwShareMode 0x%8.8x "
@@ -762,15 +893,8 @@ scard_process_connect(struct trans *con, struct stream *in_s)
               rs.dwPreferredProtocols);
     user_data = (void *) (tintptr) (uds_client->uds_client_id);
     lcontext = get_pcsc_context_by_app_context(uds_client, hContext);
-    if (lcontext == 0)
-    {
-        LOG(LOG_LEVEL_ERROR, "scard_process_connect: "
-            "get_pcsc_context_by_app_context failed");
-        return 1;
-    }
     uds_client->connect_context = lcontext;
-    scard_send_connect(user_data, lcontext->context, lcontext->context_bytes,
-                       1, &rs);
+    scard_send_connect(user_data, lcontext->context, lcontext->context_bytes, 0, &rs);
     return 0;
 }
 
@@ -782,61 +906,87 @@ scard_function_connect_return(void *user_data,
 {
     int dwActiveProtocol;
     int hCard;
-    int bytes;
     int uds_client_id;
     struct stream *out_s;
     struct pcsc_uds_client *uds_client;
     struct trans *con;
     char *card;
-    int card_bytes;
+    char dcard[16] = "unknown";
+    int return_code;
     struct pcsc_card *lcard;
+    int rv;
+    int hcontext_bytes;
+    int hcontext_present;
+    int hcard_bytes;
+    int hcard_present;
 
     LOG_DEVEL(LOG_LEVEL_DEBUG, "scard_function_connect_return:");
     LOG_DEVEL(LOG_LEVEL_DEBUG, "  status 0x%8.8x", status);
+    rv = 0;
+    card = dcard;
     uds_client_id = (int) (tintptr) user_data;
     uds_client = (struct pcsc_uds_client *)
                  get_uds_client_by_id(uds_client_id);
     if (uds_client == 0)
     {
-        LOG(LOG_LEVEL_ERROR, "scard_function_connect_return: "
-            "get_uds_client_by_id failed to find uds_client_id %d",
+        LOG(LOG_LEVEL_DEBUG, "scard_function_connect_return: "
+            "uds_client %d not found",
             uds_client_id);
-        return 1;
+        return 0;
     }
     con = uds_client->con;
     dwActiveProtocol = 0;
     hCard = 0;
+    return_code = 0;
     if (status == 0)
     {
-        in_uint8s(in_s, 36);
+        in_uint8s(in_s, 16);
+        in_uint32_le(in_s, return_code);
+        in_uint32_le(in_s, hcontext_bytes);
+        in_uint32_le(in_s, hcontext_present);
+        in_uint32_le(in_s, hcard_bytes);
+        in_uint32_le(in_s, hcard_present);
+        LOG_DEVEL(LOG_LEVEL_DEBUG, "scard_function_connect_return: hcontext_bytes %d hcard_bytes %d",
+               hcontext_bytes, hcard_bytes);
         in_uint32_le(in_s, dwActiveProtocol);
-        if (len > 40)
+        LOG_DEVEL(LOG_LEVEL_DEBUG, "dwActiveProtocol %d", dwActiveProtocol);
+        if (hcontext_bytes > 0 && hcontext_present)
         {
-            in_uint32_le(in_s, card_bytes);
-            in_uint8p(in_s, card, card_bytes);
-            lcard = context_add_card(uds_client, uds_client->connect_context,
-                                     card, card_bytes);
-            hCard = lcard->app_card;
-            LOG_DEVEL(LOG_LEVEL_DEBUG, "  hCard %d dwActiveProtocol %d", hCard,
-                      dwActiveProtocol);
+            in_uint32_le(in_s, hcontext_bytes);
+            in_uint8s(in_s, hcontext_bytes);
         }
-        else
+        if (hcard_bytes > 0 && hcard_present)
         {
-            status = 0x8010000F; /* SCARD_E_PROTO_MISMATCH */
+            in_uint32_le(in_s, hcard_bytes);
+            in_uint8p(in_s, card, hcard_bytes);
         }
+        lcard = context_add_card(uds_client, uds_client->connect_context,
+                                 card, hcard_bytes);
+        hCard = lcard->app_card;
+        LOG_DEVEL(LOG_LEVEL_DEBUG, "  hCard %d dwActiveProtocol %d", hCard,
+               dwActiveProtocol);
     }
     out_s = trans_get_out_s(con, 8192);
-    s_push_layer(out_s, iso_hdr, 8);
+    out_uint32_le(out_s, 0); /* hContext */
+    out_uint8s(out_s, 128); /* szReader */
+    out_uint32_le(out_s, 0); /* dwShareMode */
+    out_uint32_le(out_s, 0); /* dwPreferredProtocols */
     out_uint32_le(out_s, hCard);
     out_uint32_le(out_s, dwActiveProtocol);
-    out_uint32_le(out_s, status); /* SCARD_S_SUCCESS status */
+    out_uint32_le(out_s, return_code); /* rv */
     s_mark_end(out_s);
-    bytes = (int) (out_s->end - out_s->data);
-    s_pop_layer(out_s, iso_hdr);
-    out_uint32_le(out_s, bytes - 8);
-    out_uint32_le(out_s, 0x04); /* SCARD_CONNECT 0x04 */
-    return trans_force_write(con);
+    rv = trans_write_copy(con);
+    return rv;
 }
+
+#if 0
+struct disconnect_struct
+{
+    int32_t hCard;
+    uint32_t dwDisposition;
+    uint32_t rv;
+};
+#endif
 
 /*****************************************************************************/
 /* returns error */
@@ -874,8 +1024,9 @@ scard_function_disconnect_return(void *user_data,
                                  struct stream *in_s,
                                  int len, int status)
 {
-    int bytes;
+    int rv;
     int uds_client_id;
+    int return_code;
     struct stream *out_s;
     struct pcsc_uds_client *uds_client;
     struct trans *con;
@@ -887,21 +1038,25 @@ scard_function_disconnect_return(void *user_data,
                  get_uds_client_by_id(uds_client_id);
     if (uds_client == 0)
     {
-        LOG(LOG_LEVEL_ERROR, "scard_function_disconnect_return: "
-            "get_uds_client_by_id failed to find uds_client_id %d",
+        LOG(LOG_LEVEL_DEBUG, "scard_function_disconnect_return: "
+            "uds_client %d not found",
             uds_client_id);
-        return 1;
+        return 0;
     }
     con = uds_client->con;
+    return_code = 0;
+    if (status == 0)
+    {
+        in_uint8s(in_s, 16);
+        in_uint32_le(in_s, return_code);
+    }
     out_s = trans_get_out_s(con, 8192);
-    s_push_layer(out_s, iso_hdr, 8);
-    out_uint32_le(out_s, status); /* SCARD_S_SUCCESS status */
+    out_uint32_le(out_s, 0); /* hCard */
+    out_uint32_le(out_s, 0); /* dwDisposition */
+    out_uint32_le(out_s, return_code); /* rv */
     s_mark_end(out_s);
-    bytes = (int) (out_s->end - out_s->data);
-    s_pop_layer(out_s, iso_hdr);
-    out_uint32_le(out_s, bytes - 8);
-    out_uint32_le(out_s, 0x06); /* SCARD_DISCONNECT 0x06 */
-    return trans_force_write(con);
+    rv = trans_write_copy(con);
+    return rv;
 }
 
 /*****************************************************************************/
@@ -940,9 +1095,10 @@ scard_function_begin_transaction_return(void *user_data,
                                         struct stream *in_s,
                                         int len, int status)
 {
+    int rv;
     struct stream *out_s;
-    int bytes;
     int uds_client_id;
+    int return_code;
     struct pcsc_uds_client *uds_client;
     struct trans *con;
 
@@ -953,22 +1109,34 @@ scard_function_begin_transaction_return(void *user_data,
                  get_uds_client_by_id(uds_client_id);
     if (uds_client == 0)
     {
-        LOG(LOG_LEVEL_ERROR, "scard_function_begin_transaction_return: "
-            "get_uds_client_by_id failed to find uds_client_id %d",
+        LOG(LOG_LEVEL_DEBUG, "scard_function_begin_transaction_return: "
+            "uds_client %d not found",
             uds_client_id);
-        return 1;
+        return 0;
     }
     con = uds_client->con;
+    return_code = 0;
+    if (status == 0)
+    {
+        in_uint8s(in_s, 16);
+        in_uint32_le(in_s, return_code);
+    }
     out_s = trans_get_out_s(con, 8192);
-    s_push_layer(out_s, iso_hdr, 8);
-    out_uint32_le(out_s, status); /* SCARD_S_SUCCESS status */
+    out_uint32_le(out_s, 0); /* hCard */
+    out_uint32_le(out_s, return_code); /* rv */
     s_mark_end(out_s);
-    bytes = (int) (out_s->end - out_s->data);
-    s_pop_layer(out_s, iso_hdr);
-    out_uint32_le(out_s, bytes - 8);
-    out_uint32_le(out_s, 0x07); /* SCARD_BEGIN_TRANSACTION 0x07 */
-    return trans_force_write(con);
+    rv = trans_write_copy(con);
+    return rv;
 }
+
+#if 0
+struct end_struct
+{
+    int32_t hCard;
+    uint32_t dwDisposition;
+    uint32_t rv;
+};
+#endif
 
 /*****************************************************************************/
 /* returns error */
@@ -1009,9 +1177,10 @@ scard_function_end_transaction_return(void *user_data,
                                       struct stream *in_s,
                                       int len, int status)
 {
+    int rv;
     struct stream *out_s;
-    int bytes;
     int uds_client_id;
+    int return_code;
     struct pcsc_uds_client *uds_client;
     struct trans *con;
 
@@ -1022,22 +1191,26 @@ scard_function_end_transaction_return(void *user_data,
                  get_uds_client_by_id(uds_client_id);
     if (uds_client == 0)
     {
-        LOG(LOG_LEVEL_ERROR, "scard_function_end_transaction_return: "
-            "get_uds_client_by_id failed to find uds_client_id %d",
+        LOG(LOG_LEVEL_DEBUG, "scard_function_end_transaction_return: "
+            "uds_client %d not found",
             uds_client_id);
-        return 1;
+        return 0;
     }
     con = uds_client->con;
+    return_code = 0;
+    if (status == 0)
+    {
+        in_uint8s(in_s, 16);
+        in_uint32_le(in_s, return_code);
+    }
 
     out_s = trans_get_out_s(con, 8192);
-    s_push_layer(out_s, iso_hdr, 8);
-    out_uint32_le(out_s, status); /* SCARD_S_SUCCESS status */
+    out_uint32_le(out_s, 0); /* hCard */
+    out_uint32_le(out_s, 0); /* dwDisposition */
+    out_uint32_le(out_s, return_code); /* rv */
     s_mark_end(out_s);
-    bytes = (int) (out_s->end - out_s->data);
-    s_pop_layer(out_s, iso_hdr);
-    out_uint32_le(out_s, bytes - 8);
-    out_uint32_le(out_s, 0x08); /* SCARD_END_TRANSACTION 0x08 */
-    return trans_force_write(con);
+    rv = trans_write_copy(con);
+    return rv;
 }
 
 /*****************************************************************************/
@@ -1050,7 +1223,6 @@ scard_function_get_attrib_return(void *user_data,
     return 0;
 }
 
-/*****************************************************************************/
 struct pcsc_transmit
 {
     int uds_client_id;
@@ -1066,6 +1238,8 @@ scard_process_transmit(struct trans *con, struct stream *in_s)
     int hCard;
     int recv_bytes;
     int send_bytes;
+    int recv_ior_is_null;
+    int recv_is_null;
     char *send_data;
     struct xrdp_scard_io_request send_ior;
     struct xrdp_scard_io_request recv_ior;
@@ -1077,18 +1251,22 @@ scard_process_transmit(struct trans *con, struct stream *in_s)
     LOG_DEVEL(LOG_LEVEL_DEBUG, "scard_process_transmit:");
     uds_client = (struct pcsc_uds_client *) (con->callback_data);
     LOG_DEVEL(LOG_LEVEL_DEBUG, "scard_process_transmit:");
+
+    recv_ior_is_null = 0;
+    recv_is_null = 0;
+    g_memset(&send_ior, 0, sizeof(send_ior));
+    g_memset(&recv_ior, 0, sizeof(recv_ior));
     in_uint32_le(in_s, hCard);
     in_uint32_le(in_s, send_ior.dwProtocol);
     in_uint32_le(in_s, send_ior.cbPciLength);
-    in_uint32_le(in_s, send_ior.extra_bytes);
-    in_uint8p(in_s, send_ior.extra_data, send_ior.extra_bytes);
     in_uint32_le(in_s, send_bytes);
-    in_uint8p(in_s, send_data, send_bytes);
     in_uint32_le(in_s, recv_ior.dwProtocol);
     in_uint32_le(in_s, recv_ior.cbPciLength);
-    in_uint32_le(in_s, recv_ior.extra_bytes);
-    in_uint8p(in_s, recv_ior.extra_data, recv_ior.extra_bytes);
     in_uint32_le(in_s, recv_bytes);
+    in_uint8s(in_s, 4); /* rv */
+    in_uint8p(in_s, send_data, send_bytes);
+    send_ior.cbPciLength = 8;
+    recv_ior.cbPciLength = 8;
     LOG_DEVEL(LOG_LEVEL_DEBUG, "scard_process_transmit: send dwProtocol %d cbPciLength %d "
               "recv dwProtocol %d cbPciLength %d send_bytes %d ",
               send_ior.dwProtocol, send_ior.cbPciLength, recv_ior.dwProtocol,
@@ -1102,17 +1280,21 @@ scard_process_transmit(struct trans *con, struct stream *in_s)
         return 1;
     }
 
-    pcscTransmit = (struct pcsc_transmit *)
-                   g_malloc(sizeof(struct pcsc_transmit), 1);
+    pcscTransmit = g_new0(struct pcsc_transmit, 1);
+    if (pcscTransmit == 0)
+    {
+        LOG(LOG_LEVEL_ERROR, "scard_process_transmit: no memory");
+        return 1;
+    }
+
     pcscTransmit->uds_client_id = uds_client->uds_client_id;
     pcscTransmit->recv_ior = recv_ior;
     pcscTransmit->cbRecvLength = recv_bytes;
-
     scard_send_transmit(pcscTransmit,
                         lcontext->context, lcontext->context_bytes,
                         lcard->card, lcard->card_bytes,
                         send_data, send_bytes, recv_bytes,
-                        &send_ior, &recv_ior);
+                        &send_ior, &recv_ior, recv_ior_is_null, recv_is_null);
     return 0;
 }
 
@@ -1123,10 +1305,15 @@ scard_function_transmit_return(void *user_data,
                                struct stream *in_s,
                                int len, int status)
 {
+    int rv;
     struct stream *out_s;
-    int bytes;
-    int val;
+    int return_code;
     int cbRecvLength;
+    int recv_ior_present;
+    int recv_present;
+    int recv_ior_extra_present;
+    int pad;
+    int uds_client_id;
     char *recvBuf;
     struct xrdp_scard_io_request recv_ior;
     struct pcsc_uds_client *uds_client;
@@ -1137,103 +1324,118 @@ scard_function_transmit_return(void *user_data,
     LOG_DEVEL(LOG_LEVEL_DEBUG, "  status 0x%8.8x", status);
     pcscTransmit = (struct pcsc_transmit *) user_data;
     recv_ior = pcscTransmit->recv_ior;
+    uds_client_id = pcscTransmit->uds_client_id;
     uds_client = (struct pcsc_uds_client *)
-                 get_uds_client_by_id(pcscTransmit->uds_client_id);
+                 get_uds_client_by_id(uds_client_id);
     g_free(pcscTransmit);
 
     if (uds_client == 0)
     {
-        LOG(LOG_LEVEL_ERROR, "scard_function_transmit_return: "
-            "get_uds_client_by_id failed");
-        return 1;
+        LOG(LOG_LEVEL_DEBUG, "scard_function_transmit_return: "
+            "uds_client %d not found",
+            uds_client_id);
+        return 0;
     }
     con = uds_client->con;
     cbRecvLength = 0;
     recvBuf = 0;
+    return_code = 0;
     if (status == 0)
     {
-        in_uint8s(in_s, 20);
-        in_uint32_le(in_s, val);
-        if (val != 0)
+        in_uint8s(in_s, 16);
+        in_uint32_le(in_s, return_code);
+        in_uint32_le(in_s, recv_ior_present);
+        in_uint32_le(in_s, cbRecvLength);
+        in_uint32_le(in_s, recv_present);
+        LOG_DEVEL(LOG_LEVEL_DEBUG, "scard_function_transmit_return: recv_ior_present %d recv_present %d",
+               recv_ior_present, recv_present);
+        if (recv_ior_present != 0)
         {
             /* pioRecvPci */
-            in_uint8s(in_s, 8);
             in_uint32_le(in_s, recv_ior.dwProtocol);
             in_uint32_le(in_s, recv_ior.cbPciLength);
             recv_ior.cbPciLength += 8;
-            in_uint32_le(in_s, recv_ior.extra_bytes);
-            if (recv_ior.extra_bytes > 0)
+            in_uint32_le(in_s, recv_ior_extra_present);
+            if (recv_ior_extra_present != 0)
             {
-                in_uint8p(in_s, recv_ior.extra_data, recv_ior.extra_bytes);
+                in_uint32_le(in_s, recv_ior.extra_bytes);
+                if (recv_ior.extra_bytes > 0)
+                {
+                    in_uint8p(in_s, recv_ior.extra_data, recv_ior.extra_bytes);
+                }
+                pad = (4 - recv_ior.extra_bytes) & 3;
+                in_uint8s(in_s, pad);
             }
         }
-
-        in_uint8s(in_s, 4);
-        in_uint32_le(in_s, val);
-        if (val != 0)
+        if (recv_present != 0)
         {
-            in_uint32_le(in_s, cbRecvLength);
-            in_uint8p(in_s, recvBuf, cbRecvLength);
+            if (s_check_rem(in_s, 4 + cbRecvLength))
+            {
+                in_uint32_le(in_s, cbRecvLength);
+                in_uint8p(in_s, recvBuf, cbRecvLength);
+                pad = (4 - cbRecvLength) & 3;
+                in_uint8s(in_s, pad);
+            }
         }
-
     }
     LOG_DEVEL(LOG_LEVEL_DEBUG, "scard_function_transmit_return: cbRecvLength %d", cbRecvLength);
-    out_s = trans_get_out_s(con, 8192);
-    s_push_layer(out_s, iso_hdr, 8);
+
+    out_s = trans_get_out_s(con, 8192 + cbRecvLength);
+    out_uint32_le(out_s, 0); /* hCard */
+    out_uint32_le(out_s, 0); /* send_ior.dwProtocol */
+    out_uint32_le(out_s, 0); /* send_ior.cbPciLength */
+    out_uint32_le(out_s, 0); /* send_bytes */
     out_uint32_le(out_s, recv_ior.dwProtocol);
     out_uint32_le(out_s, recv_ior.cbPciLength);
-    out_uint32_le(out_s, recv_ior.extra_bytes);
-    out_uint8a(out_s, recv_ior.extra_data, recv_ior.extra_bytes);
     out_uint32_le(out_s, cbRecvLength);
-    out_uint8a(out_s, recvBuf, cbRecvLength);
-    out_uint32_le(out_s, status); /* SCARD_S_SUCCESS status */
+    out_uint32_le(out_s, return_code); /* rv */
+    out_uint8p(out_s, recvBuf, cbRecvLength);
     s_mark_end(out_s);
-    bytes = (int) (out_s->end - out_s->data);
-    s_pop_layer(out_s, iso_hdr);
-    out_uint32_le(out_s, bytes - 8);
-    out_uint32_le(out_s, 0x09); /* SCARD_TRANSMIT 0x09 */
-    return trans_force_write(con);
+    rv = trans_write_copy(con);
+    return rv;
 }
 
 /*****************************************************************************/
-/* returns error */
+struct pcsc_control_struct
+{
+    int hCard;
+    tui32 dwControlCode;
+    tui32 cbSendLength;
+    tui32 cbRecvLength;
+    tui32 dwBytesReturned;
+    tui32 rv;
+};
+
+#define SCARD_E_UNSUPPORTED_FEATURE 0x8010001F
+/*****************************************************************************/
+/* process but return not supported*/
 int
 scard_process_control(struct trans *con, struct stream *in_s)
 {
-    int hCard;
-    int send_bytes;
-    int recv_bytes;
-    int control_code;
-    char *send_data;
-    struct pcsc_uds_client *uds_client;
-    void *user_data;
-    struct pcsc_context *lcontext;
-    struct pcsc_card *lcard;
+    struct pcsc_control_struct pcscCtl;
+    char* sentBuffer;
+    int rv, pcscCtrlLength;
+    struct stream *out_s;
 
     LOG_DEVEL(LOG_LEVEL_DEBUG, "scard_process_control:");
-    uds_client = (struct pcsc_uds_client *) (con->callback_data);
-    LOG_DEVEL(LOG_LEVEL_DEBUG, "scard_process_control:");
+    rv = 0;
+    pcscCtrlLength = sizeof(pcscCtl);
+    in_uint8a(in_s, &pcscCtl, pcscCtrlLength);
+    sentBuffer = g_new0(char, pcscCtl.cbSendLength);
+    in_uint8a(in_s, sentBuffer, pcscCtl.cbSendLength);
 
-    in_uint32_le(in_s, hCard);
-    in_uint32_le(in_s, control_code);
-    in_uint32_le(in_s, send_bytes);
-    in_uint8p(in_s, send_data, send_bytes);
-    in_uint32_le(in_s, recv_bytes);
+    pcscCtl.cbRecvLength = pcscCtl.cbSendLength;
+    pcscCtl.dwBytesReturned = 0;
+    pcscCtl.rv = SCARD_E_UNSUPPORTED_FEATURE;
 
-    user_data = (void *) (tintptr) (uds_client->uds_client_id);
-    lcard = get_pcsc_card_by_app_card(uds_client, hCard, &lcontext);
-    if ((lcard == 0) || (lcontext == 0))
-    {
-        LOG(LOG_LEVEL_ERROR, "scard_process_control: "
-            "get_pcsc_card_by_app_card failed");
-        return 1;
-    }
-    scard_send_control(user_data, lcontext->context, lcontext->context_bytes,
-                       lcard->card, lcard->card_bytes,
-                       send_data, send_bytes, recv_bytes,
-                       control_code);
+    LOG_DEVEL(LOG_LEVEL_DEBUG, "scard_process_control: return SCARD_E_UNSUPPORTED_FEATURE");
+    out_s = trans_get_out_s(con, pcscCtrlLength);
+    out_uint8a(out_s, &pcscCtl, pcscCtrlLength);
+    s_mark_end(out_s);
+    rv = trans_write_copy(con);
 
-    return 0;
+    g_free(sentBuffer);
+    return rv;
 }
 
 /*****************************************************************************/
@@ -1243,47 +1445,7 @@ scard_function_control_return(void *user_data,
                               struct stream *in_s,
                               int len, int status)
 {
-    struct stream *out_s;
-    int bytes;
-    int cbRecvLength;
-    char *recvBuf;
-    int uds_client_id;
-    struct pcsc_uds_client *uds_client;
-    struct trans *con;
-
-    LOG_DEVEL(LOG_LEVEL_DEBUG, "scard_function_control_return:");
-    LOG_DEVEL(LOG_LEVEL_DEBUG, "  status 0x%8.8x", status);
-    uds_client_id = (int) (tintptr) user_data;
-    uds_client = (struct pcsc_uds_client *)
-                 get_uds_client_by_id(uds_client_id);
-    if (uds_client == 0)
-    {
-        LOG(LOG_LEVEL_ERROR, "scard_function_control_return: "
-            "get_uds_client_by_id failed to find uds_client_id %d",
-            uds_client_id);
-        return 1;
-    }
-    con = uds_client->con;
-    cbRecvLength = 0;
-    recvBuf = 0;
-    if (status == 0)
-    {
-        in_uint8s(in_s, 28);
-        in_uint32_le(in_s, cbRecvLength);
-        in_uint8p(in_s, recvBuf, cbRecvLength);
-    }
-    LOG_DEVEL(LOG_LEVEL_DEBUG, "scard_function_control_return: cbRecvLength %d", cbRecvLength);
-    out_s = trans_get_out_s(con, 8192);
-    s_push_layer(out_s, iso_hdr, 8);
-    out_uint32_le(out_s, cbRecvLength);
-    out_uint8a(out_s, recvBuf, cbRecvLength);
-    out_uint32_le(out_s, status); /* SCARD_S_SUCCESS status */
-    s_mark_end(out_s);
-    bytes = (int) (out_s->end - out_s->data);
-    s_pop_layer(out_s, iso_hdr);
-    out_uint32_le(out_s, bytes - 8);
-    out_uint32_le(out_s, 0x0A); /* SCARD_CONTROL 0x0A */
-    return trans_force_write(con);
+    return 0;
 }
 
 /*****************************************************************************/
@@ -1298,23 +1460,18 @@ struct pcsc_status
 int
 scard_process_status(struct trans *con, struct stream *in_s)
 {
+    int rv;
     int hCard;
-    int cchReaderLen;
-    int cbAtrLen;
     struct pcsc_uds_client *uds_client;
     struct pcsc_card *lcard;
     struct pcsc_context *lcontext;
     struct pcsc_status *pcscStatus;
+    struct stream *out_s;
 
     LOG_DEVEL(LOG_LEVEL_DEBUG, "scard_process_status:");
+    rv = 0;
     uds_client = (struct pcsc_uds_client *) (con->callback_data);
-
     in_uint32_le(in_s, hCard);
-    in_uint32_le(in_s, cchReaderLen);
-    in_uint32_le(in_s, cbAtrLen);
-    LOG_DEVEL(LOG_LEVEL_DEBUG, "scard_process_status: hCard 0x%8.8x cchReaderLen %d "
-              "cbAtrLen %d", hCard, cchReaderLen, cbAtrLen);
-
     lcard = get_pcsc_card_by_app_card(uds_client, hCard, &lcontext);
     if ((lcard == 0) || (lcontext == 0))
     {
@@ -1322,15 +1479,32 @@ scard_process_status(struct trans *con, struct stream *in_s)
             "get_pcsc_card_by_app_card failed");
         return 1;
     }
-    pcscStatus = (struct pcsc_status *) g_malloc(sizeof(struct pcsc_status), 1);
-    pcscStatus->uds_client_id = uds_client->uds_client_id;
-    pcscStatus->cchReaderLen = cchReaderLen;
-    scard_send_status(pcscStatus, 1,
-                      lcontext->context, lcontext->context_bytes,
-                      lcard->card, lcard->card_bytes,
-                      cchReaderLen, cbAtrLen);
-
-    return 0;
+    LOG_DEVEL(LOG_LEVEL_DEBUG, "scard_process_status: send_status %d", uds_client->send_status);
+    if (uds_client->send_status)
+    {
+        uds_client->send_status = 0;
+        pcscStatus = g_new0(struct pcsc_status, 1);
+        if (pcscStatus == 0)
+        {
+            LOG(LOG_LEVEL_ERROR, "scard_process_status: no memory");
+            return 1;
+        }
+        pcscStatus->uds_client_id = uds_client->uds_client_id;
+        pcscStatus->cchReaderLen = 128;
+        scard_send_status(pcscStatus, 0,
+                          lcontext->context, lcontext->context_bytes,
+                          lcard->card, lcard->card_bytes,
+                          128, MAX_ATR_SIZE, 0);
+    }
+    else
+    {
+        out_s = trans_get_out_s(con, 8192);
+        out_uint32_le(out_s, 0); /* hCard */
+        out_uint32_le(out_s, 0); /* rv */
+        s_mark_end(out_s);
+        rv = trans_write_copy(con);
+    }
+    return rv;
 }
 
 #define MS_SCARD_UNKNOWN    0
@@ -1362,106 +1536,203 @@ scard_function_status_return(void *user_data,
                              struct stream *in_s,
                              int len, int status)
 {
-    struct stream *out_s;
+
     int index;
-    int bytes;
     int dwReaderLen;
     int dwState;
     int dwProtocol;
     int dwAtrLen;
-    char attr[32];
-    twchar reader_name[100];
-    char lreader_name[100];
+    int return_code;
+    char attr[MAX_ATR_SIZE];
+    char reader_name[128];
+    int rv;
+    struct stream *out_s;
+    struct pcsc_status *pcscStatus;
     int uds_client_id;
     struct pcsc_uds_client *uds_client;
     struct trans *con;
-    struct pcsc_status *pcscStatus;
 
     LOG_DEVEL(LOG_LEVEL_DEBUG, "scard_function_status_return:");
-    LOG_DEVEL(LOG_LEVEL_DEBUG, "  status 0x%8.8x", status);
-
     pcscStatus = (struct pcsc_status *) user_data;
     if (pcscStatus == 0)
     {
         LOG(LOG_LEVEL_ERROR, "scard_function_status_return: pcscStatus is nil");
         return 1;
     }
-
     uds_client_id = pcscStatus->uds_client_id;
     uds_client = (struct pcsc_uds_client *)
                  get_uds_client_by_id(uds_client_id);
     if (uds_client == 0)
     {
-        LOG(LOG_LEVEL_ERROR, "scard_function_status_return: "
-            "get_uds_client_by_id failed to find uds_client_id %d",
+        LOG(LOG_LEVEL_DEBUG, "scard_function_status_return: "
+            "uds_client %d not found",
             uds_client_id);
         g_free(pcscStatus);
-        return 1;
+        return 0;
     }
     g_free(pcscStatus);
-    con = uds_client->con;
+
     dwReaderLen = 0;
     dwState = 0;
     dwProtocol = 0;
     dwAtrLen = 0;
-    lreader_name[0] = 0;
+    reader_name[0] = 0;
+    return_code = 0;
+
     if (status == 0)
     {
-        in_uint8s(in_s, 20);
+        in_uint8s(in_s, 16);
+        in_uint32_le(in_s, return_code);
         in_uint32_le(in_s, dwReaderLen);
         in_uint8s(in_s, 4);
         in_uint32_le(in_s, dwState);
-        dwState = g_ms2pc[dwState % 6];
+        dwState = g_ms2pc[dwState % 7];
         in_uint32_le(in_s, dwProtocol);
         in_uint8a(in_s, attr, 32);
         in_uint32_le(in_s, dwAtrLen);
+        LOG_DEVEL(LOG_LEVEL_DEBUG, "scard_function_status_return: return_code 0x%8.8x", return_code);
         if (dwReaderLen > 0)
         {
-            in_uint32_le(in_s, dwReaderLen);
-            dwReaderLen /= 2;
+            in_uint8s(in_s, 4);
         }
         else
         {
             dwReaderLen = 1;
         }
-        if (dwReaderLen < 1)
+        if (dwReaderLen > 127)
         {
-            LOG(LOG_LEVEL_ERROR, "scard_function_status_return: dwReaderLen < 1");
-            dwReaderLen = 1;
+            LOG(LOG_LEVEL_ERROR, "scard_function_status_return: dwReaderLen too big "
+                   "0x%8.8x", dwReaderLen);
+            dwReaderLen = 127;
         }
-        if (dwReaderLen > 99)
-        {
-            LOG_DEVEL(LOG_LEVEL_WARNING, "scard_function_status_return: dwReaderLen too big "
-                      "0x%8.8x", dwReaderLen);
-            dwReaderLen = 99;
-        }
+
         g_memset(reader_name, 0, sizeof(reader_name));
-        g_memset(lreader_name, 0, sizeof(lreader_name));
-        for (index = 0; index < dwReaderLen - 1; index++)
-        {
-            in_uint16_le(in_s, reader_name[index]);
-        }
-        g_wcstombs(lreader_name, reader_name, 99);
+        in_uint8a(in_s, reader_name, dwReaderLen);
+
     }
-    LOG_DEVEL(LOG_LEVEL_DEBUG, "scard_function_status_return: dwAtrLen %d dwReaderLen %d "
-              "dwProtocol %d dwState %d name %s",
-              dwAtrLen, dwReaderLen, dwProtocol, dwState, lreader_name);
+
+    for (index = 0; index < 16; index++)
+    {
+        if (g_strcmp(reader_name, uds_client->readerStates[index].readerName) == 0)
+        {
+            LOG_DEVEL(LOG_LEVEL_DEBUG, "scard_function_status_return: found read [%s]", reader_name);
+            LOG_DEVEL(LOG_LEVEL_DEBUG, "  updateing cardAtrLength from %d to %d", uds_client->readerStates[index].cardAtrLength, dwAtrLen);
+            uds_client->readerStates[index].cardAtrLength = dwAtrLen;
+            g_memcpy(uds_client->readerStates[index].cardAtr, attr, dwAtrLen);
+            LOG_DEVEL(LOG_LEVEL_DEBUG, "  updateing cardProtocol from %d to %d", uds_client->readerStates[index].cardProtocol, dwProtocol);
+            uds_client->readerStates[index].cardProtocol = dwProtocol;
+            LOG_DEVEL(LOG_LEVEL_DEBUG, "  updateing dwState from %d to %d", uds_client->readerStates[index].readerState, dwState);
+            uds_client->readerStates[index].readerState = dwState;
+        }
+    }
+
+    con = uds_client->con;
+    rv = 0;
     out_s = trans_get_out_s(con, 8192);
-    s_push_layer(out_s, iso_hdr, 8);
-    dwReaderLen = g_strlen(lreader_name);
-    out_uint32_le(out_s, dwReaderLen);
-    out_uint8a(out_s, lreader_name, dwReaderLen);
-    out_uint32_le(out_s, dwState);
-    out_uint32_le(out_s, dwProtocol);
-    out_uint32_le(out_s, dwAtrLen);
-    out_uint8a(out_s, attr, dwAtrLen);
-    out_uint32_le(out_s, status); /* SCARD_S_SUCCESS status */
+    out_uint32_le(out_s, 0); /* hCard */
+    out_uint32_le(out_s, return_code); /* rv */
     s_mark_end(out_s);
-    bytes = (int) (out_s->end - out_s->data);
-    s_pop_layer(out_s, iso_hdr);
-    out_uint32_le(out_s, bytes - 8);
-    out_uint32_le(out_s, 0x0B); /* SCARD_STATUS 0x0B */
-    return trans_force_write(con);
+    rv = trans_write_copy(con);
+    return rv;
+}
+
+/*****************************************************************************/
+/* returns error */
+static int
+scard_process_cmd_version(struct trans *con, struct stream *in_s)
+{
+    int rv;
+    int major = 0;
+    int minor = 0;
+    struct pcsc_uds_client *uds_client;
+    void *user_data;
+
+    LOG_DEVEL(LOG_LEVEL_DEBUG, "scard_process_version:");
+    rv = 0;
+    in_uint32_le(in_s, major);
+    in_uint32_le(in_s, minor);
+    LOG_DEVEL(LOG_LEVEL_DEBUG, "scard_process_version: major %d minor %d", major, minor);
+    uds_client = (struct pcsc_uds_client *) (con->callback_data);
+    uds_client->state = 1;
+    uds_client->vMajor = major;
+    uds_client->vMinor = minor;
+    user_data = (void *) (tintptr) (uds_client->uds_client_id);
+    scard_send_establish_context(user_data, 0); /* SCARD_SCOPE_USER */
+    return rv;
+}
+
+/*****************************************************************************/
+/* returns error */
+static int
+scard_process_cmd_get_readers_state(struct trans *con, struct stream *in_s)
+{
+    int rv;
+    struct stream *out_s;
+    struct pcsc_uds_client *uds_client;
+
+    LOG_DEVEL(LOG_LEVEL_DEBUG, "scard_process_cmd_get_readers_state:");
+    rv = 0;
+    uds_client = (struct pcsc_uds_client *) (con->callback_data);
+    out_s = trans_get_out_s(con, sizeof(uds_client->readerStates));
+    out_uint8a(out_s, uds_client->readerStates, sizeof(uds_client->readerStates));
+    s_mark_end(out_s);
+    rv = trans_write_copy(con);
+    return rv;
+}
+
+/*****************************************************************************/
+/* returns error */
+static int
+scard_process_cmd_wait_reader_state_change(struct trans *con,
+                                           struct stream *in_s)
+{
+    int rv;
+    int timeOut __attribute__((unused));
+    int reader_state_bytes;
+    struct stream *out_s;
+    struct pcsc_uds_client *uds_client;
+
+    LOG_DEVEL(LOG_LEVEL_DEBUG, "scard_process_cmd_wait_reader_state_change:");
+    uds_client = (struct pcsc_uds_client *) (con->callback_data);
+    uds_client->waiting = 1;
+    if ((uds_client->vMajor == 4) && (uds_client->vMinor > 2)) {
+        //In these versions, return reader states immediatly
+        reader_state_bytes = sizeof(uds_client->readerStates);
+        out_s = trans_get_out_s(con, reader_state_bytes);
+        out_uint8a(out_s, uds_client->readerStates, reader_state_bytes);
+        s_mark_end(out_s);
+        rv = trans_write_copy(con);
+    } else {
+        in_uint32_le(in_s, timeOut);
+        LOG_DEVEL(LOG_LEVEL_DEBUG, "scard_process_cmd_wait_reader_state_change: timeOut %d",
+           timeOut);
+        in_uint32_le(in_s, rv);
+        LOG_DEVEL(LOG_LEVEL_DEBUG, "scard_process_cmd_wait_reader_state_change: rv %d", rv);
+    }
+
+    return rv;
+}
+
+/*****************************************************************************/
+/* returns error */
+static int
+scard_process_cmd_stop_waiting_reader_state_change(struct trans *con,
+                                                   struct stream *in_s)
+{
+    int rv;
+    struct stream *out_s;
+    struct pcsc_uds_client *uds_client;
+
+    LOG_DEVEL(LOG_LEVEL_DEBUG, "scard_process_cmd_stop_waiting_reader_state_change:");
+    out_s = trans_get_out_s(con, 8192);
+    out_uint32_le(out_s, 0); /* timeOut */
+    out_uint32_le(out_s, 0); /* rv */
+    s_mark_end(out_s);
+    rv = trans_write_copy(con);
+    uds_client = (struct pcsc_uds_client *) (con->callback_data);
+    uds_client->waiting = 0;
+    uds_client->something_changed = 0;
+    return rv;
 }
 
 /*****************************************************************************/
@@ -1469,61 +1740,6 @@ scard_function_status_return(void *user_data,
 int
 scard_process_get_status_change(struct trans *con, struct stream *in_s)
 {
-    int index;
-    int hContext;
-    int dwTimeout;
-    int cReaders;
-    READER_STATE *rsa;
-    struct pcsc_uds_client *uds_client;
-    void *user_data;
-    struct pcsc_context *lcontext;
-
-    LOG_DEVEL(LOG_LEVEL_DEBUG, "scard_process_get_status_change:");
-    uds_client = (struct pcsc_uds_client *) (con->callback_data);
-    in_uint32_le(in_s, hContext);
-    in_uint32_le(in_s, dwTimeout);
-    in_uint32_le(in_s, cReaders);
-    if ((cReaders < 0) || (cReaders > 16))
-    {
-        LOG(LOG_LEVEL_ERROR, "scard_process_get_status_change: bad cReaders %d", cReaders);
-        return 1;
-    }
-    rsa = (READER_STATE *) g_malloc(sizeof(READER_STATE) * cReaders, 1);
-
-    for (index = 0; index < cReaders; index++)
-    {
-        in_uint8a(in_s, rsa[index].reader_name, 100);
-        LOG_DEVEL(LOG_LEVEL_DEBUG, "scard_process_get_status_change: reader_name %s",
-                  rsa[index].reader_name);
-        in_uint32_le(in_s, rsa[index].current_state);
-        LOG_DEVEL(LOG_LEVEL_DEBUG, "scard_process_get_status_change: current_state %d",
-                  rsa[index].current_state);
-        in_uint32_le(in_s, rsa[index].event_state);
-        LOG_DEVEL(LOG_LEVEL_DEBUG, "scard_process_get_status_change: event_state %d",
-                  rsa[index].event_state);
-        in_uint32_le(in_s, rsa[index].atr_len);
-        LOG_DEVEL(LOG_LEVEL_DEBUG, "scard_process_get_status_change: atr_len %d",
-                  rsa[index].atr_len);
-        in_uint8a(in_s, rsa[index].atr, 36);
-    }
-
-    LOG_DEVEL(LOG_LEVEL_DEBUG, "scard_process_get_status_change: hContext 0x%8.8x dwTimeout "
-              "%d cReaders %d", hContext, dwTimeout, cReaders);
-
-    user_data = (void *) (tintptr) (uds_client->uds_client_id);
-    lcontext = get_pcsc_context_by_app_context(uds_client, hContext);
-    if (lcontext == 0)
-    {
-        LOG(LOG_LEVEL_ERROR, "scard_process_get_status_change: "
-            "get_pcsc_context_by_app_context failed");
-        g_free(rsa);
-        return 1;
-    }
-    scard_send_get_status_change(user_data,
-                                 lcontext->context, lcontext->context_bytes,
-                                 1, dwTimeout, cReaders, rsa);
-    g_free(rsa);
-
     return 0;
 }
 
@@ -1533,68 +1749,141 @@ scard_function_get_status_change_return(void *user_data,
                                         struct stream *in_s,
                                         int len, int status)
 {
-    int bytes;
-    int index;
+    int rv;
+    int return_code;
     int cReaders;
-    tui32 current_state;
-    tui32 event_state;
-    tui32 atr_len; /* number of bytes in atr[] */
-    tui8 atr[36];
-    struct stream *out_s;
+    int index;
+    int current_state;
+    int event_state;
+    int cardAtrLength;
     int uds_client_id;
     struct pcsc_uds_client *uds_client;
-    struct trans *con;
+    struct stream *out_s;
+
+    READER_STATE *rsa;
+    struct pcsc_context *context;
 
     LOG_DEVEL(LOG_LEVEL_DEBUG, "scard_function_get_status_change_return:");
-    LOG_DEVEL(LOG_LEVEL_DEBUG, "  status 0x%8.8x", status);
+    rv = 0;
+    cReaders = 0;
+    return_code = 0;
     uds_client_id = (int) (tintptr) user_data;
     uds_client = (struct pcsc_uds_client *)
                  get_uds_client_by_id(uds_client_id);
     if (uds_client == 0)
     {
-        LOG(LOG_LEVEL_ERROR, "scard_function_get_status_change_return: "
-            "get_uds_client_by_id failed to find uds_client_id %d",
+        LOG(LOG_LEVEL_DEBUG, "scard_function_get_status_change_return: "
+            "uds_client %d not found",
             uds_client_id);
-        return 1;
+        return 0;
     }
-    con = uds_client->con;
 
-    out_s = trans_get_out_s(con, 8192);
-    s_push_layer(out_s, iso_hdr, 8);
-    if (status != 0)
+    if (status == 0)
     {
-        out_uint32_le(out_s, 0); /* cReaders */
-        out_uint32_le(out_s, status); /* SCARD_S_SUCCESS status */
-    }
-    else
-    {
-        in_uint8s(in_s, 28);
+        in_uint8s(in_s, 16);
+        in_uint32_le(in_s, return_code);
+        in_uint8s(in_s, 8);
         in_uint32_le(in_s, cReaders);
         LOG_DEVEL(LOG_LEVEL_DEBUG, "  cReaders %d", cReaders);
-        out_uint32_le(out_s, cReaders);
+        if (return_code != 0)
+        {
+            cReaders = 0;
+        }
         if (cReaders > 0)
         {
             for (index = 0; index < cReaders; index++)
             {
-                in_uint32_le(in_s, current_state);
-                out_uint32_le(out_s, current_state);
-                in_uint32_le(in_s, event_state);
-                out_uint32_le(out_s, event_state);
-                in_uint32_le(in_s, atr_len);
-                out_uint32_le(out_s, atr_len);
-                in_uint8a(in_s, atr, 36);
-                out_uint8a(out_s, atr, 36);
+                in_uint32_le(in_s, current_state); /* current state */
+                in_uint32_le(in_s, event_state); /* event state */
+                LOG_DEVEL(LOG_LEVEL_DEBUG, "    index %d current_state 0x%8.8x event_state 0x%8.8x", index, current_state, event_state);
+                uds_client->current_states[index] = current_state;
+                uds_client->event_states[index] = event_state;
+                if (event_state & 0x0002) /* SCARD_STATE_CHANGED */
+                {
+                    if (event_state & 0x0020) /* SCARD_STATE_PRESENT */
+                    {
+                        uds_client->readerStates[index].readerState = 0x0004; /* SCARD_PRESENT */
+                    }
+                    else
+                    {
+                        uds_client->readerStates[index].readerState = 0x0002; /* SCARD_ABSENT */
+                    }
+                    uds_client->something_changed = 1;
+                    uds_client->send_status = 1;
+                }
+                in_uint32_le(in_s, uds_client->readerStates[index].cardAtrLength);
+                in_uint8a(in_s, uds_client->readerStates[index].cardAtr, MAX_ATR_SIZE);
+                in_uint8s(in_s, 3);
+                uds_client->readerStates[index].eventCounter = (event_state >> 16) & 0xFFFF;
             }
         }
-        out_uint32_le(out_s, status); /* SCARD_S_SUCCESS status */
+
+        context = get_first_pcsc_context(uds_client);
+
+        if (uds_client->state == 1)
+        {
+            /* send version back */
+            out_s = trans_get_out_s(uds_client->con, 8192);
+            out_uint32_le(out_s, 4);
+            out_uint32_le(out_s, 3);
+            out_uint32_le(out_s, 0); /* result */
+            s_mark_end(out_s);
+            rv = trans_write_copy(uds_client->con);
+            uds_client->state = 0;
+            return_code = 0x8010000A;
+        }
+
+        if (return_code == 0x8010000A) /* SCARD_E_TIMEOUT */
+        {
+            rsa = g_new(READER_STATE, uds_client->numReaders + 1);
+            if (rsa != 0)
+            {
+                for (index = 0; index < uds_client->numReaders; index++)
+                {
+                    g_strncpy(rsa[index].reader_name, uds_client->readerStates[index].readerName, 127);
+                    rsa[index].current_state = uds_client->event_states[index] & ~2;
+                    rsa[index].event_state = uds_client->event_states[index];
+                    cardAtrLength = MIN(33, uds_client->readerStates[index].cardAtrLength);
+                    cardAtrLength = MAX(0, cardAtrLength);
+                    g_memcpy(rsa[index].atr, uds_client->readerStates[index].cardAtr, cardAtrLength);
+                    rsa[index].atr_len = cardAtrLength;
+                }
+                /* add plug and play notifier */
+                g_strncpy(rsa[index].reader_name, "\\\\?PnP?\\Notification", 127);
+                rsa[index].current_state = index << 16;
+                scard_send_get_status_change((void*)(tintptr)uds_client->uds_client_id,
+                                             context->context,
+                                             context->context_bytes,
+                                             0, 0xFFFFFFFF, index + 1, rsa);
+                g_free(rsa);
+            }
+
+        }
+        else if (return_code == 0)
+        {
+            scard_send_list_readers((void*)(tintptr)uds_client->uds_client_id,
+                                    context->context,
+                                    context->context_bytes,
+                                    0, 8148, 0, 0);
+        }
+
     }
 
-    s_mark_end(out_s);
-    bytes = (int) (out_s->end - out_s->data);
-    s_pop_layer(out_s, iso_hdr);
-    out_uint32_le(out_s, bytes - 8);
-    out_uint32_le(out_s, 0x0C); /* SCARD_ESTABLISH_CONTEXT 0x0C */
-    return trans_force_write(con);
+    LOG_DEVEL(LOG_LEVEL_DEBUG, "scard_function_get_status_change_return: something changed %d waiting %d cReaders %d return_code 0x%8.8x",
+               uds_client->something_changed, uds_client->waiting, cReaders, return_code);
+
+    if (cReaders == 0 && uds_client->waiting && uds_client->something_changed)
+    {
+        LOG_DEVEL(LOG_LEVEL_DEBUG, "scard_function_get_status_change_return: something changed");
+        uds_client->waiting = 0;
+        uds_client->something_changed = 0;
+        out_s = trans_get_out_s(uds_client->con, 8192);
+        out_uint32_le(out_s, 0); /* timeOut */
+        out_uint32_le(out_s, 0); /* rv */
+        s_mark_end(out_s);
+        rv = trans_write_copy(uds_client->con);
+    }
+    return rv;
 }
 
 /*****************************************************************************/
@@ -1602,6 +1891,8 @@ scard_function_get_status_change_return(void *user_data,
 int
 scard_process_cancel(struct trans *con, struct stream *in_s)
 {
+    int rv;
+    struct stream *out_s;
     int hContext;
     struct pcsc_uds_client *uds_client;
     void *user_data;
@@ -1615,9 +1906,13 @@ scard_process_cancel(struct trans *con, struct stream *in_s)
     lcontext = get_pcsc_context_by_app_context(uds_client, hContext);
     if (lcontext == 0)
     {
-        LOG(LOG_LEVEL_ERROR, "scard_process_cancel: "
-            "get_pcsc_context_by_app_context failed");
-        return 1;
+        LOG(LOG_LEVEL_ERROR, "scard_process_cancel: get_pcsc_context_by_app_context failed");
+        out_s = trans_get_out_s(uds_client->con, 8192);
+        out_uint32_le(out_s, 0); /* hContext */
+        out_uint32_le(out_s, 0); /* rv */
+        s_mark_end(out_s);
+        rv = trans_write_copy(uds_client->con);
+        return rv;
     }
     scard_send_cancel(user_data, lcontext->context, lcontext->context_bytes);
     return 0;
@@ -1630,11 +1925,11 @@ scard_function_cancel_return(void *user_data,
                              struct stream *in_s,
                              int len, int status)
 {
-    int bytes;
+    int rv;
     int uds_client_id;
+    int return_code;
     struct stream *out_s;
     struct pcsc_uds_client *uds_client;
-    struct trans *con;
 
     LOG_DEVEL(LOG_LEVEL_DEBUG, "scard_function_cancel_return:");
     LOG_DEVEL(LOG_LEVEL_DEBUG, "  status 0x%8.8x", status);
@@ -1643,21 +1938,23 @@ scard_function_cancel_return(void *user_data,
                  get_uds_client_by_id(uds_client_id);
     if (uds_client == 0)
     {
-        LOG(LOG_LEVEL_ERROR, "scard_function_cancel_return: "
-            "get_uds_client_by_id failed to find uds_client_id %d",
+        LOG(LOG_LEVEL_DEBUG, "scard_function_cancel_return: "
+            "uds_client %d not found",
             uds_client_id);
-        return 1;
+        return 0;
     }
-    con = uds_client->con;
-    out_s = trans_get_out_s(con, 8192);
-    s_push_layer(out_s, iso_hdr, 8);
-    out_uint32_le(out_s, status); /* SCARD_S_SUCCESS status */
+    return_code = 0;
+    if (status == 0)
+    {
+        in_uint8s(in_s, 16);
+        in_uint32_le(in_s, return_code);
+    }
+    out_s = trans_get_out_s(uds_client->con, 8192);
+    out_uint32_le(out_s, 0); /* hContext */
+    out_uint32_le(out_s, return_code); /* rv */
     s_mark_end(out_s);
-    bytes = (int) (out_s->end - out_s->data);
-    s_pop_layer(out_s, iso_hdr);
-    out_uint32_le(out_s, bytes - 8);
-    out_uint32_le(out_s, 0x0D); /* SCARD_CANCEL 0x0D */
-    return trans_force_write(con);
+    rv = trans_write_copy(uds_client->con);
+    return rv;
 }
 
 /*****************************************************************************/
@@ -1765,6 +2062,26 @@ scard_process_msg(struct trans *con, struct stream *in_s, int command)
             LOG_DEVEL(LOG_LEVEL_INFO, "scard_process_msg: SCARD_SET_ATTRIB");
             break;
 
+        case 0x11: /* CMD_VERSION */
+            LOG_DEVEL(LOG_LEVEL_INFO, "scard_process_msg: CMD_VERSION");
+            rv = scard_process_cmd_version(con, in_s);
+            break;
+
+        case 0x12: /* CMD_GET_READERS_STATE */
+            LOG_DEVEL(LOG_LEVEL_INFO, "scard_process_msg: CMD_GET_READERS_STATE");
+            rv = scard_process_cmd_get_readers_state(con, in_s);
+            break;
+
+        case 0x13: /* CMD_WAIT_READER_STATE_CHANGE */
+            LOG_DEVEL(LOG_LEVEL_INFO, "scard_process_msg: CMD_WAIT_READER_STATE_CHANGE");
+            rv = scard_process_cmd_wait_reader_state_change(con, in_s);
+            break;
+
+        case 0x14: /* CMD_STOP_WAITING_READER_STATE_CHANGE */
+            LOG_DEVEL(LOG_LEVEL_INFO, "scard_process_msg: CMD_STOP_WAITING_READER_STATE_CHANGE");
+            rv = scard_process_cmd_stop_waiting_reader_state_change(con, in_s);
+            break;
+
         default:
             LOG_DEVEL(LOG_LEVEL_WARNING, "scard_process_msg: unknown mtype 0x%4.4x", command);
             rv = 1;
@@ -1788,14 +2105,64 @@ my_pcsc_trans_data_in(struct trans *trans)
     {
         return 0;
     }
+    error = 0;
     s = trans_get_in_s(trans);
-    in_uint32_le(s, size);
-    in_uint32_le(s, command);
-    LOG_DEVEL(LOG_LEVEL_DEBUG, "my_pcsc_trans_data_in: size %d command %d", size, command);
-    error = trans_force_read(trans, size);
-    if (error == 0)
+    switch (trans->extra_flags)
     {
-        error = scard_process_msg(trans, s, command);
+        case 0:
+            s->p = s->data;
+            in_uint32_le(s, size);
+            in_uint32_le(s, command);
+            LOG_DEVEL(LOG_LEVEL_DEBUG, "my_pcsc_trans_data_in: size %d command %d", size, command);
+            trans->extra_flags = command;
+            if (size > 0)
+            {
+                trans->header_size = 8 + size;
+                break;
+            }
+            /* fallthrough */
+        default:
+            LOG_DEVEL(LOG_LEVEL_DEBUG, "my_pcsc_trans_data_in: got payload");
+            s->p = s->data;
+            in_uint8s(s, 4); /* size */
+            in_uint32_le(s, command);
+            LOG_DEVEL(LOG_LEVEL_DEBUG, "my_pcsc_trans_data_in: default command %d", command);
+            error = scard_process_msg(trans, s, command);
+            init_stream(s, 0);
+            trans->header_size = 8;
+            trans->extra_flags = 0;
+            break;
+        case 9: /* transmit */
+            LOG_DEVEL(LOG_LEVEL_DEBUG, "my_pcsc_trans_data_in: special transmit");
+            s->p = s->data;
+            in_uint8s(s, 12 + 8);
+            in_uint32_le(s, size);
+            s->p = s->data;
+            if (size < 1)
+            {
+                in_uint8s(s, 4); /* size */
+                in_uint32_le(s, command);
+                LOG_DEVEL(LOG_LEVEL_DEBUG, "my_pcsc_trans_data_in: 9 command %d", command);
+                error = scard_process_msg(trans, s, command);
+                init_stream(s, 0);
+                trans->header_size = 8;
+                trans->extra_flags = 0;
+                break;
+            }
+            trans->header_size += size;
+            trans->extra_flags = 999;
+            break;
+        case 999: /* transmit */
+            LOG_DEVEL(LOG_LEVEL_DEBUG, "my_pcsc_trans_data_in: special transmit 999");
+            s->p = s->data;
+            in_uint8s(s, 4); /* size */
+            in_uint32_le(s, command);
+            LOG_DEVEL(LOG_LEVEL_DEBUG, "my_pcsc_trans_data_in: 999 command %d", command);
+            error = scard_process_msg(trans, s, command);
+            init_stream(s, 0);
+            trans->header_size = 8;
+            trans->extra_flags = 0;
+            break;
     }
     return error;
 }
@@ -1824,6 +2191,7 @@ my_pcsc_trans_conn_in(struct trans *trans, struct trans *new_trans)
         return 1;
     }
 
+    LOG_DEVEL(LOG_LEVEL_DEBUG, "my_pcsc_trans_conn_in: got connection");
     uds_client = create_uds_client(new_trans);
     if (uds_client == 0)
     {
@@ -1831,6 +2199,7 @@ my_pcsc_trans_conn_in(struct trans *trans, struct trans *new_trans)
     }
     uds_client->con->trans_data_in = my_pcsc_trans_data_in;
     uds_client->con->header_size = 8;
+    uds_client->con->no_stream_init_on_data_in = 1;
 
     if (g_uds_clients == 0)
     {
@@ -1845,8 +2214,7 @@ my_pcsc_trans_conn_in(struct trans *trans, struct trans *new_trans)
 int
 scard_pcsc_init(void)
 {
-    char *home;
-    int disp;
+    const char *home;
     int error;
 
     LOG_DEVEL(LOG_LEVEL_DEBUG, "scard_pcsc_init:");
@@ -1854,8 +2222,7 @@ scard_pcsc_init(void)
     {
         g_lis = trans_create(2, 8192, 8192);
         home = g_getenv("HOME");
-        disp = g_display_num;
-        g_snprintf(g_pcsclite_ipc_dir, 255, "%s/.pcsc%d", home, disp);
+        g_snprintf(g_pcsclite_ipc_dir, 255, "%s/.pcsc", home);
 
         if (g_directory_exist(g_pcsclite_ipc_dir))
         {
@@ -1894,7 +2261,19 @@ scard_pcsc_init(void)
 int
 scard_pcsc_deinit(void)
 {
+    struct pcsc_uds_client *uds_client;
+
     LOG_DEVEL(LOG_LEVEL_DEBUG, "scard_pcsc_deinit:");
+
+    if (g_uds_clients != 0)
+    {
+        while (g_uds_clients->count)
+        {
+            uds_client = (struct pcsc_uds_client *)
+                         list_get_item(g_uds_clients, 0);
+            free_uds_client(uds_client);
+        }
+    }
 
     if (g_lis != 0)
     {
@@ -1902,14 +2281,10 @@ scard_pcsc_deinit(void)
         g_lis = 0;
     }
 
-    if (g_pcsclite_ipc_dir[0] != 0)
+    if (g_pcsclite_ipc_file[0] != 0)
     {
         g_file_delete(g_pcsclite_ipc_file);
-        if (!g_remove_dir(g_pcsclite_ipc_dir))
-        {
-            LOG_DEVEL(LOG_LEVEL_WARNING, "scard_pcsc_deinit: g_remove_dir failed");
-        }
-        g_pcsclite_ipc_dir[0] = 0;
+        g_pcsclite_ipc_file[0] = 0;
     }
 
     return 0;

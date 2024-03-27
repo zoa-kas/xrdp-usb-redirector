@@ -1,0 +1,1 @@
+#modprobe -r vhci-hcd

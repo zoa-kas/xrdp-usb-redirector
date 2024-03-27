@@ -43,7 +43,9 @@ typedef unsigned long uintptr_t;
 #endif
 #endif
 
+#if !defined(__cplusplus)
 typedef int bool_t;
+#endif
 
 /* you can define L_ENDIAN or B_ENDIAN and NEED_ALIGN or NO_NEED_ALIGN
    in the makefile to override */

@@ -7,7 +7,7 @@ AM_CPPFLAGS = \
   -DXRDP_CFG_PATH=\"${sysconfdir}/xrdp\" \
   -DXRDP_SBIN_PATH=\"${sbindir}\" \
   -DXRDP_SHARE_PATH=\"${datadir}/xrdp\" \
-  -DXRDP_PID_PATH=\"${localstatedir}/run\" \
+  -DXRDP_PID_PATH=\"${localstatedir}/run/xrdp\" \
   -DXRDP_SOCKET_PATH=\"${socketdir}\" \
   -I$(top_srcdir)/common
 
@@ -75,12 +75,14 @@ xrdp_chansrv_SOURCES = \
   xcommon.c \
   xcommon.h \
   audin.c \
-  audin.h
+  audin.h \
+  urbdrc.c \
+  urbdrc.h
 
 xrdp_chansrv_LDFLAGS = \
   $(X_LIBS)
 
 xrdp_chansrv_LDADD = \
   $(top_builddir)/common/libcommon.la \
-  $(X_PRE_LIBS) -lXfixes -lXrandr -lX11 $(X_EXTRA_LIBS) \
+  $(X_PRE_LIBS) -lXfixes -lXrandr -lX11 -ldl $(X_EXTRA_LIBS) \
   $(CHANSRV_EXTRA_LIBS)

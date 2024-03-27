@@ -47,7 +47,7 @@ X11DisplayOffset=10
 ;; MaxSessions - maximum number of connections to an xrdp server
 ; Type: integer
 ; Default: 0
-MaxSessions=50
+MaxSessions=1
 
 ;; KillDisconnected - kill disconnected sessions
 ; Type: boolean

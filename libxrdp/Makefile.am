@@ -5,7 +5,7 @@ AM_CPPFLAGS = \
   -DXRDP_CFG_PATH=\"${sysconfdir}/xrdp\" \
   -DXRDP_SBIN_PATH=\"${sbindir}\" \
   -DXRDP_SHARE_PATH=\"${datadir}/xrdp\" \
-  -DXRDP_PID_PATH=\"${localstatedir}/run\" \
+  -DXRDP_PID_PATH=\"${localstatedir}/run/xrdp\" \
   -I$(top_srcdir)/common
 
 AM_CFLAGS = $(OPENSSL_CFLAGS)
@@ -30,7 +30,8 @@ LIBXRDP_EXTRA_LIBS += -lturbojpeg
 else
 if XRDP_JPEG
 AM_CPPFLAGS += -DXRDP_JPEG
-LIBXRDP_EXTRA_LIBS += -ljpeg
+AM_CPPFLAGS += -I$(top_srcdir)/libjpeg/include
+LIBXRDP_EXTRA_LIBS += $(top_builddir)/libjpeg/.libs/libjpeg.la
 endif
 endif
 

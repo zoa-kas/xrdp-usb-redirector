@@ -7,7 +7,7 @@ AM_CPPFLAGS = \
   -DXRDP_CFG_PATH=\"${sysconfdir}/xrdp\" \
   -DXRDP_SBIN_PATH=\"${sbindir}\" \
   -DXRDP_SHARE_PATH=\"${datadir}/xrdp\" \
-  -DXRDP_PID_PATH=\"${localstatedir}/run\" \
+  -DXRDP_PID_PATH=\"${localstatedir}/run/xrdp\" \
   -DXRDP_MODULE_PATH=\"${moduledir}\" \
   -DXRDP_SOCKET_PATH=\"${socketdir}\" \
   -I$(top_builddir) \
@@ -21,7 +21,7 @@ XRDP_EXTRA_LIBS =
 if XRDP_RFXCODEC
 AM_CPPFLAGS += -DXRDP_RFXCODEC
 AM_CPPFLAGS += -I$(top_srcdir)/librfxcodec/include
-XRDP_EXTRA_LIBS += $(top_builddir)/librfxcodec/src/.libs/librfxencode.a
+XRDP_EXTRA_LIBS += $(top_builddir)/librfxcodec/src/.libs/librfxencode.la
 endif
 
 if XRDP_PIXMAN
@@ -33,7 +33,7 @@ endif
 if XRDP_PAINTER
 AM_CPPFLAGS += -DXRDP_PAINTER
 AM_CPPFLAGS += -I$(top_srcdir)/libpainter/include
-XRDP_EXTRA_LIBS += $(top_builddir)/libpainter/src/.libs/libpainter.a
+XRDP_EXTRA_LIBS += $(top_builddir)/libpainter/src/.libs/libpainter.la
 endif
 
 sbin_PROGRAMS = \
