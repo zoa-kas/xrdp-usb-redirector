@@ -1490,6 +1490,7 @@ scard_send_Reconnect(IRP *irp, char *context, int context_bytes,
     out_uint8a(s, context, context_bytes);
     out_uint32_le(s, card_bytes);
     out_uint8a(s, card, card_bytes);
+    out_uint8s(s, 4);
 
     s_mark_end(s);
 
