@@ -1480,19 +1480,30 @@ scard_send_Reconnect(IRP *irp, char *context, int context_bytes,
      * u32    4 bytes    handle length
      * u32    4 bytes    handle
      */
+    s_push_layer(s, mcs_hdr, 4); /* bytes, set later */
 
-    xstream_seek(s, 24); /* TODO */
-
+    out_uint32_le(s, 0x00000000);
+    out_uint32_le(s, context_bytes);
+    out_uint32_le(s, 0x00020000);
+    out_uint32_le(s, card_bytes);
+    out_uint32_le(s, 0x00020004);
+    
     out_uint32_le(s, rs->dwShareMode);
     out_uint32_le(s, rs->dwPreferredProtocols);
     out_uint32_le(s, rs->init_type);
+
     out_uint32_le(s, context_bytes);
     out_uint8a(s, context, context_bytes);
+
     out_uint32_le(s, card_bytes);
     out_uint8a(s, card, card_bytes);
-    out_uint8s(s, 4);
 
     s_mark_end(s);
+
+    s_pop_layer(s, mcs_hdr);
+    bytes = (int) (s->end - s->p);
+    bytes -= 8;
+    out_uint32_le(s, bytes);
 
     s_pop_layer(s, iso_hdr);
     bytes = (int) (s->end - s->p);
@@ -2155,15 +2166,26 @@ scard_send_GetAttrib(IRP *irp, char *card, int card_bytes, READER_STATE *rs)
      * u32    4 bytes    handle
      */
 
-    xstream_seek(s, 24); /* TODO */
+    s_push_layer(s, mcs_hdr, 4);
+    out_uint32_le(s, 0x00000000);
+    // Note: add context but here don't used.
+    // Need for freerdp:smartcard_unpack_redir_scard_context_
+    out_uint32_le(s, 0);
+    out_uint32_le(s, 0);
+    out_uint32_le(s, card_bytes);
+    out_uint32_le(s, 0x00020000);    /* map1 */
     out_uint32_le(s, rs->dwAttribId);
     out_uint32_le(s, 0);
     out_uint32_le(s, rs->dwAttrLen);
-    xstream_seek(s, 8);
     out_uint32_le(s, card_bytes);
     out_uint8a(s, card, card_bytes);
 
     s_mark_end(s);
+
+    s_pop_layer(s, mcs_hdr);
+    bytes = (int) (s->end - s->p);
+    bytes -= 8;
+    out_uint32_le(s, bytes);
 
     s_pop_layer(s, iso_hdr);
     bytes = (int) (s->end - s->p);
